@@ -13,7 +13,7 @@
 # limitations under the License.
 
 VERSION             ?= $(shell cat VERSION)
-REGISTRY            ?= eu.gcr.io/gardener-project/gardener
+REGISTRY            ?= node-647ee1368442ecd1a315c673.ps-xaas.io/gardener
 IMAGE_REPOSITORY    := $(REGISTRY)/etcdbrctl
 IMAGE_TAG           := $(VERSION)
 BUILD_DIR           := build
@@ -44,7 +44,7 @@ build-local:
 
 .PHONY: docker-build
 docker-build:
-	@docker build -t ${IMG} -f $(BUILD_DIR)/Dockerfile --rm .
+	@docker build --platform amd64 -t ${IMG} -f $(BUILD_DIR)/Dockerfile --rm .
 
 .PHONY: docker-push
 docker-push:

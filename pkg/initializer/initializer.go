@@ -57,21 +57,42 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 	ctx := context.Background()
 	var err error
 
+	shouldRestoreFromSnapshot := false
+
+	m := member.NewMemberControl(e.Config.EtcdConnectionConfig)
+	clientSet, err := miscellaneous.GetKubernetesClientSetOrError()
+	if err != nil {
+		logger.Fatalf("failed to create clientset, %v", err)
+	}
+
+	//Fork: Don't add as learner as this doesn't work for initial member after scale-up -> DB is gone
+	isFirst := m.IsFirstMember()
+
+	readyReplicas, err := m.GetReadyReplicas(ctx, clientSet)
+	if err != nil {
+		logger.Fatalf("unable to determin ready replicas: %v", err)
+	}
+
+	if isFirst && readyReplicas == 0 {
+		logger.Info("Won't add member as learner because there are no members to learn from")
+
+		//Fork: Set isInMemory so we can later determine if this is a a normal etcd cluster or a in-memory one
+		shouldRestoreFromSnapshot = true
+	}
+
 	//Etcd cluster scale-up case
 	if miscellaneous.IsMultiNode(logger) {
-		clientSet, err := miscellaneous.GetKubernetesClientSetOrError()
-		if err != nil {
-			logger.Fatalf("failed to create clientset, %v", err)
-		}
-		m := member.NewMemberControl(e.Config.EtcdConnectionConfig)
 		isScaleup, err := m.IsClusterScaledUp(ctx, clientSet)
 		if err != nil {
 			logger.Errorf("scale-up not detected: %v", err)
-		} else if isScaleup {
+		} else if isScaleup && !shouldRestoreFromSnapshot {
 			logger.Info("Etcd cluster scale-up is detected")
 			// Add a learner(non-voting member) to a etcd cluster with retry
 			// If backup-restore is unable to add a learner in a cluster
 			// restart the `initialization` by exiting the backup-restore.
+
+			logger.Info("Trying to add member as learner")
+
 			if err := member.AddLearnerWithRetry(ctx, m, addLearnerAttempts, e.Config.RestoreOptions.Config.DataDir); err != nil {
 				logger.Fatalf("unable to add a learner in a cluster: %v", err)
 			}
@@ -104,7 +125,9 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 	metrics.ValidationDurationSeconds.With(prometheus.Labels{metrics.LabelSucceeded: metrics.ValueSucceededTrue}).Observe(time.Since(start).Seconds())
 
 	if dataDirStatus != validator.DataDirectoryValid {
-		if dataDirStatus == validator.DataDirStatusInvalidInMultiNode || (e.Validator.OriginalClusterSize > 1 && dataDirStatus == validator.DataDirectoryCorrupt) || (e.Validator.OriginalClusterSize > 1 && isEtcdMemberPresent) {
+		// Fork: Use isScalingUp here
+		// isScalingUp is true if we are currenty scaling up,
+		if !shouldRestoreFromSnapshot && (dataDirStatus == validator.DataDirStatusInvalidInMultiNode || (e.Validator.OriginalClusterSize > 1 && dataDirStatus == validator.DataDirectoryCorrupt) || (e.Validator.OriginalClusterSize > 1 && isEtcdMemberPresent)) {
 			start := time.Now()
 			if err := e.restoreInMultiNode(ctx); err != nil {
 				metrics.RestorationDurationSeconds.With(prometheus.Labels{metrics.LabelRestorationKind: metrics.ValueRestoreSingleMemberInMultiNode, metrics.LabelSucceeded: metrics.ValueSucceededFalse}).Observe(time.Since(start).Seconds())

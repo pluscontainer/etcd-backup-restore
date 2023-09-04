@@ -81,8 +81,6 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 		shouldRestoreFromSnapshot = true
 	}
 
-	//Etcd cluster scale-up case
-	if miscellaneous.IsMultiNode(logger) {
 	podName, err := miscellaneous.GetEnvVarOrError("POD_NAME")
 	if err != nil {
 		logger.Fatalf("Error reading POD_NAME env var : %v", err)

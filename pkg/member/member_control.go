@@ -403,6 +403,8 @@ func (m *memberControl) GetReadyReplicas(ctx context.Context, clientSet client.C
 	}
 
 	return int(etcdsts.Status.ReadyReplicas), nil
+}
+
 // WasMemberInCluster checks the whether etcd member was part of etcd cluster.
 func (m *memberControl) WasMemberInCluster(ctx context.Context, clientSet client.Client) bool {
 

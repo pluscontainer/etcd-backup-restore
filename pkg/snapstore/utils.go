@@ -15,7 +15,6 @@
 package snapstore
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"path"
@@ -76,7 +75,15 @@ func GetSnapstore(config *brtypes.SnapstoreConfig) (brtypes.SnapStore, error) {
 		if config.Container == "" {
 			config.Container = defaultLocalStore
 		}
-		return NewLocalSnapStore(path.Join(config.Container, config.Prefix))
+		if strings.HasPrefix(config.Container, "../../../test/output") {
+			// To be used only by unit tests
+			return NewLocalSnapStore(path.Join(config.Container, config.Prefix))
+		}
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, err
+		}
+		return NewLocalSnapStore(path.Join(homeDir, config.Container, config.Prefix))
 	case brtypes.SnapstoreProviderS3:
 		return NewS3SnapStore(config)
 	case brtypes.SnapstoreProviderABS:
@@ -171,36 +178,46 @@ func adaptPrefix(snap *brtypes.Snapshot, snapstorePrefix string) string {
 	return snapstorePrefix
 }
 
-// GetSnapstoreSecretHash returns the hash of object store secrets hash
-func GetSnapstoreSecretHash(config *brtypes.SnapstoreConfig) (string, error) {
-	switch config.Provider {
+// GetSnapstoreSecretModifiedTime returns the latest modification timestamp of the access credential files.
+// Returns an error if fetching the timestamp of the access credential files fails.
+func GetSnapstoreSecretModifiedTime(snapstoreProvider string) (time.Time, error) {
+	switch snapstoreProvider {
 	case brtypes.SnapstoreProviderLocal:
-		return "", nil
+		return time.Time{}, nil
 	case brtypes.SnapstoreProviderS3:
-		return S3SnapStoreHash(config)
+		return GetS3CredentialsLastModifiedTime()
 	case brtypes.SnapstoreProviderABS:
-		return ABSSnapStoreHash(config)
+		return GetABSCredentialsLastModifiedTime()
 	case brtypes.SnapstoreProviderGCS:
-		return GCSSnapStoreHash(config)
+		return GetGCSCredentialsLastModifiedTime()
 	case brtypes.SnapstoreProviderSwift:
-		return SwiftSnapStoreHash(config)
+		return GetSwiftCredentialsLastModifiedTime()
 	case brtypes.SnapstoreProviderOSS:
-		return OSSSnapStoreHash(config)
+		return GetOSSCredentialsLastModifiedTime()
 	case brtypes.SnapstoreProviderOCS:
-		return OCSSnapStoreHash(config)
+		return GetOCSCredentialsLastModifiedTime()
 	default:
-		return "", nil
+		return time.Time{}, nil
 	}
 }
 
-func getHash(data interface{}) string {
-	switch dat := data.(type) {
-	case string:
-		sha := sha256.Sum256([]byte(dat))
-		return fmt.Sprintf("%x", sha)
-	case []byte:
-		sha := sha256.Sum256(dat)
-		return fmt.Sprintf("%x", sha)
+// getLatestCredentialsModifiedTime returns the latest file modification time from a list of files
+func getLatestCredentialsModifiedTime(credentialFiles []string) (time.Time, error) {
+	var latestModifiedTime time.Time
+
+	for _, filename := range credentialFiles {
+		// os.Stat instead of file.Info because the file is symlinked
+		fileInfo, err := os.Stat(filename)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if fileInfo.IsDir() {
+			return time.Time{}, fmt.Errorf("a directory %s found in place of a credential file", fileInfo.Name())
+		}
+		fileModifiedTime := fileInfo.ModTime()
+		if latestModifiedTime.Before(fileModifiedTime) {
+			latestModifiedTime = fileModifiedTime
+		}
 	}
-	return ""
+	return latestModifiedTime, nil
 }

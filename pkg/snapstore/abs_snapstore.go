@@ -23,9 +23,11 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/sirupsen/logrus"
@@ -34,8 +36,8 @@ import (
 )
 
 const (
-	absCredentialFile     = "AZURE_APPLICATION_CREDENTIALS"
-	absCredentialJSONFile = "AZURE_APPLICATION_CREDENTIALS_JSON"
+	absCredentialDirectory = "AZURE_APPLICATION_CREDENTIALS"
+	absCredentialJSONFile  = "AZURE_APPLICATION_CREDENTIALS_JSON"
 )
 
 // ABSSnapStore is an ABS backed snapstore.
@@ -90,7 +92,7 @@ func getCredentials(prefixString string) (string, string, error) {
 		return credentials.StorageAccount, credentials.SecretKey, nil
 	}
 
-	if dir, isSet := os.LookupEnv(prefixString + absCredentialFile); isSet {
+	if dir, isSet := os.LookupEnv(prefixString + absCredentialDirectory); isSet {
 		credentials, err := readABSCredentialFiles(dir)
 		if err != nil {
 			return "", "", fmt.Errorf("error getting credentials from %v dir", dir)
@@ -347,34 +349,31 @@ func (a *ABSSnapStore) Delete(snap brtypes.Snapshot) error {
 	return nil
 }
 
-// ABSSnapStoreHash calculates and returns the hash of azure object storage snapstore secret.
-func ABSSnapStoreHash(config *brtypes.SnapstoreConfig) (string, error) {
-	if _, isSet := os.LookupEnv(absCredentialFile); isSet {
-		if dir := os.Getenv(absCredentialFile); dir != "" {
-			absConfig, err := readABSCredentialFiles(dir)
-			if err != nil {
-				return "", fmt.Errorf("error getting credentials from %v directory", dir)
-			}
-			return getABSHash(absConfig), nil
+// GetABSCredentialsLastModifiedTime returns the latest modification timestamp of the ABS credential file(s)
+func GetABSCredentialsLastModifiedTime() (time.Time, error) {
+	if dir, isSet := os.LookupEnv(absCredentialDirectory); isSet {
+		// credential files which are essential for creating the snapstore
+		credentialFiles := []string{"storageKey", "storageAccount"}
+		for i := range credentialFiles {
+			credentialFiles[i] = filepath.Join(dir, credentialFiles[i])
 		}
+		absTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to get ABS credential timestamp from the directory %v with error: %v", dir, err)
+		}
+		return absTimeStamp, nil
 	}
 
-	if _, isSet := os.LookupEnv(absCredentialJSONFile); isSet {
-		if filename := os.Getenv(absCredentialJSONFile); filename != "" {
-			absConfig, err := readABSCredentialsJSON(filename)
-			if err != nil {
-				return "", fmt.Errorf("error getting credentials using %v file", filename)
-			}
-			return getABSHash(absConfig), nil
+	if filename, isSet := os.LookupEnv(absCredentialJSONFile); isSet {
+		credentialFiles := []string{filename}
+		absTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to fetch file information of the ABS JSON credential file %v with error: %v", filename, err)
 		}
+		return absTimeStamp, nil
 	}
 
-	return "", nil
-}
-
-func getABSHash(config *absCredentials) string {
-	data := fmt.Sprintf("%s%s", config.SecretKey, config.StorageAccount)
-	return getHash(data)
+	return time.Time{}, fmt.Errorf("no environment variable set for the ABS credential file")
 }
 
 func isABSConfigEmpty(config *absCredentials) error {

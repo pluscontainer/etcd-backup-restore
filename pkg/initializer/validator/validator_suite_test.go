@@ -17,7 +17,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/embed"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -153,7 +153,9 @@ func copyDir(sourceDirPath, destinationDirPath string) error {
 			os.Mkdir(destPath, fileInfo.Mode())
 			copyDir(sourcePath, destPath)
 		} else if fileInfo.Mode().IsRegular() {
-			copyFile(sourcePath, destPath, fileInfo.Mode())
+			if err := copyFile(sourcePath, destPath, fileInfo.Mode()); err != nil {
+				return err
+			}
 		} else {
 			return fmt.Errorf("File format not known")
 		}

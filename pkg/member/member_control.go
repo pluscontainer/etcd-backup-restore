@@ -1,3 +1,17 @@
+// Copyright (c) 2023 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package member
 
 import (
@@ -19,6 +33,7 @@ import (
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/etcdserver/api/v3rpc/rpctypes"
 	"go.etcd.io/etcd/etcdserver/etcdserverpb"
+	v1 "k8s.io/api/coordination/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -58,6 +73,9 @@ type Control interface {
 
 	// IsMemberInCluster checks is the current members peer URL is already part of the etcd cluster
 	IsMemberInCluster(context.Context) (bool, error)
+
+	// WasMemberInCluster checks whether current members was part of the etcd cluster or not.
+	WasMemberInCluster(context.Context, client.Client) bool
 
 	// PromoteMember promotes an etcd member from a learner to a voting member of the cluster.
 	// This will succeed if and only if learner is in a healthy state and the learner is in sync with leader.
@@ -385,6 +403,29 @@ func (m *memberControl) GetReadyReplicas(ctx context.Context, clientSet client.C
 	}
 
 	return int(etcdsts.Status.ReadyReplicas), nil
+// WasMemberInCluster checks the whether etcd member was part of etcd cluster.
+func (m *memberControl) WasMemberInCluster(ctx context.Context, clientSet client.Client) bool {
+
+	if etcdMemberPresent, err := m.IsMemberInCluster(ctx); err != nil {
+		m.logger.Errorf("unable to check member presence via api call: %v", err)
+	} else {
+		return etcdMemberPresent
+	}
+
+	m.logger.Info("fetching the member lease associated with etcd member")
+	memberLease := &v1.Lease{}
+	if err := clientSet.Get(ctx, client.ObjectKey{
+		Namespace: m.podNamespace,
+		Name:      m.podName,
+	}, memberLease); err != nil {
+		m.logger.Errorf("couldn't fetch member lease while checking if the member was part of the cluster: %v", err)
+		return false
+	}
+
+	if memberLease.Spec.HolderIdentity == nil {
+		return false
+	}
+	return true
 }
 
 // AddLearnerWithRetry add a new member as a learner with exponential backoff.

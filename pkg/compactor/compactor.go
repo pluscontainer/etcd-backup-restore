@@ -1,3 +1,17 @@
+// Copyright (c) 2023 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package compactor
 
 import (
@@ -77,7 +91,10 @@ func (cp *Compactor) Compact(ctx context.Context, opts *brtypes.CompactOptions) 
 	}()
 
 	// Then restore from the snapshots
-	r := restorer.NewRestorer(cp.store, cp.logger)
+	r, err := restorer.NewRestorer(cp.store, cp.logger)
+	if err != nil {
+		return nil, err
+	}
 	embeddedEtcd, err := r.Restore(*compactorRestoreOptions, nil)
 	if err != nil {
 		return nil, fmt.Errorf("unable to restore snapshots during compaction: %v", err)
@@ -181,5 +198,22 @@ func (cp *Compactor) Compact(ctx context.Context, opts *brtypes.CompactOptions) 
 		cancel()
 	}
 
+	// Add a sleep command so that prometheus can collect necessary metrics related to the uploading of snapshots. see https://github.com/gardener/etcd-druid/issues/648
+	err = sleepWithContext(ctx, opts.MetricsScrapeWaitDuration.Duration)
+	if err != nil {
+		cp.logger.Warnf("Could not sleep for specified duration: %v", err)
+	}
+
 	return snapshot, nil
+}
+
+func sleepWithContext(ctx context.Context, sleepFor time.Duration) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sleepFor):
+			return nil
+		}
+	}
 }

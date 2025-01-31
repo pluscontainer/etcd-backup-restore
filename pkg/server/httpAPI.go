@@ -26,7 +26,6 @@ import (
 	"net/http/pprof"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -404,13 +403,7 @@ func (h *HTTPHandler) serveLatestSnapshotMetadata(rw http.ResponseWriter, req *h
 
 func (h *HTTPHandler) serveConfig(rw http.ResponseWriter, req *http.Request) {
 	inputFileName := miscellaneous.EtcdConfigFilePath
-	dir, err := os.UserHomeDir()
-	if err != nil {
-		h.Logger.Warnf("Unable to get user home dir: %v", err)
-		rw.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	outputFileName := filepath.Join(dir, "etcd.conf.yaml")
+	outputFileName := "/tmp/etcd.conf.yaml"
 	configYML, err := os.ReadFile(inputFileName)
 	if err != nil {
 		h.Logger.Warnf("Unable to read etcd config file: %v", err)

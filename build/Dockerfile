@@ -19,8 +19,9 @@ COPY . .
 
 RUN make build
 
-FROM gcr.io/distroless/static-debian11:nonroot AS backup-restore
+FROM alpine:3 AS backup-restore
 
 COPY --from=builder /go/src/github.com/gardener/backup-restore/bin/etcdbrctl /etcdbrctl
+RUN chmod og+rw /home
 WORKDIR /
 ENTRYPOINT ["/etcdbrctl"]

@@ -44,7 +44,7 @@ build-local:
 
 .PHONY: docker-build
 docker-build:
-	@docker build -t ${IMG} -f $(BUILD_DIR)/Dockerfile --rm .
+	@docker build --platform linux/amd64 -t ${IMG} -f $(BUILD_DIR)/Dockerfile --rm .
 
 .PHONY: docker-push
 docker-push:

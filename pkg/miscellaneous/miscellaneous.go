@@ -66,6 +66,26 @@ const (
 	https = "https"
 )
 
+type advertiseURLsConfig struct {
+	AdvertiseClientURLs      map[string][]string `json:"advertise-client-urls"`
+	InitialAdvertisePeerURLs map[string][]string `json:"initial-advertise-peer-urls"`
+}
+
+func GetSnapshotMatchingName(store brtypes.SnapStore, name string) (*brtypes.Snapshot, error) {
+	snapList, err := store.List()
+	if err != nil {
+		return nil, err
+	}
+
+	for i := len(snapList) - 1; i >= 0; i-- {
+		if snapList[i].SnapName == name && snapList[i].Kind == brtypes.SnapshotKindFull {
+			return snapList[i], nil
+		}
+	}
+
+	return nil, nil
+}
+
 // GetLatestFullSnapshotAndDeltaSnapList returns the latest snapshot
 func GetLatestFullSnapshotAndDeltaSnapList(store brtypes.SnapStore) (*brtypes.Snapshot, brtypes.SnapList, error) {
 	var (

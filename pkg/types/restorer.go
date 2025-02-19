@@ -37,6 +37,7 @@ const (
 	defaultEmbeddedEtcdQuotaBytes   = 8 * 1024 * 1024 * 1024 //8Gib
 	defaultAutoCompactionMode       = "periodic"             // only 2 mode is supported: 'periodic' or 'revision'
 	defaultAutoCompactionRetention  = "30m"
+	defaultFromSnapshotWithName     = ""
 )
 
 // NewClientFactoryFunc allows to define how to create a client.Factory
@@ -52,6 +53,7 @@ type RestoreOptions struct {
 	PeerURLs            types.URLs
 	// Base full snapshot + delta snapshots to restore from
 	BaseSnapshot     *Snapshot
+	SnapshotName     string
 	DeltaSnapList    SnapList
 	NewClientFactory NewClientFactoryFunc
 }
@@ -73,6 +75,7 @@ type RestorationConfig struct {
 	EmbeddedEtcdQuotaBytes   int64    `json:"embeddedEtcdQuotaBytes,omitempty"`
 	AutoCompactionMode       string   `json:"autoCompactionMode,omitempty"`
 	AutoCompactionRetention  string   `json:"autoCompactionRetention,omitempty"`
+	FromSnapshotWithName     string   `json:"fromSnapshotWithName,omitempty"`
 }
 
 // NewRestorationConfig returns the restoration config.
@@ -92,6 +95,7 @@ func NewRestorationConfig() *RestorationConfig {
 		EmbeddedEtcdQuotaBytes:   int64(defaultEmbeddedEtcdQuotaBytes),
 		AutoCompactionMode:       defaultAutoCompactionMode,
 		AutoCompactionRetention:  defaultAutoCompactionRetention,
+		FromSnapshotWithName:     defaultFromSnapshotWithName,
 	}
 }
 
@@ -111,6 +115,7 @@ func (c *RestorationConfig) AddFlags(fs *flag.FlagSet) {
 	fs.Int64Var(&c.EmbeddedEtcdQuotaBytes, "embedded-etcd-quota-bytes", c.EmbeddedEtcdQuotaBytes, "maximum backend quota for the embedded etcd used for applying delta snapshots")
 	fs.StringVar(&c.AutoCompactionMode, "auto-compaction-mode", c.AutoCompactionMode, "mode for auto-compaction: 'periodic' for duration based retention. 'revision' for revision number based retention.")
 	fs.StringVar(&c.AutoCompactionRetention, "auto-compaction-retention", c.AutoCompactionRetention, "Auto-compaction retention length.")
+	fs.StringVar(&c.FromSnapshotWithName, "from-snapshot-with-name", c.FromSnapshotWithName, "Restore from snapshot with supplied name.")
 }
 
 // Validate validates the config.

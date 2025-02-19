@@ -17,10 +17,11 @@ REGISTRY            ?= node-647ee1368442ecd1a315c673.ps-xaas.io/gardener
 IMAGE_REPOSITORY    := $(REGISTRY)/etcdbrctl
 IMAGE_TAG           := $(VERSION)
 BUILD_DIR           := build
+PLATFORM			?= $(shell uname | tr '[:upper:]' '[:lower:]')/$(shell arch)
 BIN_DIR             := bin
 COVERPROFILE        := test/output/coverprofile.out
 
-IMG ?= ${IMAGE_REPOSITORY}:${IMAGE_TAG}
+IMG                 ?= ${IMAGE_REPOSITORY}:${IMAGE_TAG}
 
 .DEFAULT_GOAL := build-local
 
@@ -44,7 +45,7 @@ build-local:
 
 .PHONY: docker-build
 docker-build:
-	@docker build --platform linux/amd64 -t ${IMG} -f $(BUILD_DIR)/Dockerfile --rm .
+	@docker build --platform ${PLATFORM} -t ${IMG} -f $(BUILD_DIR)/Dockerfile --rm .
 
 .PHONY: docker-push
 docker-push:

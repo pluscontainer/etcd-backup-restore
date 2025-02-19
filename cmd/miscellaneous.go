@@ -56,8 +56,16 @@ func BuildRestoreOptionsAndStore(opts *restorerOptions) (*brtypes.RestoreOptions
 		logger.Fatalf("failed to create restore snapstore from configured storage provider: %v", err)
 	}
 
-	logger.Info("Finding latest set of snapshot to recover from...")
-	baseSnap, deltaSnapList, err := miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
+	var baseSnap *brtypes.Snapshot
+	var deltaSnapList brtypes.SnapList
+	if opts.restorationConfig.FromSnapshotWithName != "" {
+		logger.Info("Finding snapshot matching supplied name [%s]...", opts.restorationConfig.FromSnapshotWithName)
+		baseSnap, err = miscellaneous.GetSnapshotMatchingName(store, opts.restorationConfig.FromSnapshotWithName)
+	} else {
+		logger.Info("Finding latest set of snapshot to recover from...")
+		baseSnap, deltaSnapList, err = miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
+	}
+
 	if err != nil {
 		logger.Fatalf("failed to get latest snapshot: %v", err)
 	}

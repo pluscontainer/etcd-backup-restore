@@ -67,13 +67,8 @@ type advertiseURLsConfig struct {
 	InitialAdvertisePeerURLs map[string][]string `json:"initial-advertise-peer-urls"`
 }
 
-type advertiseURLsConfig struct {
-	AdvertiseClientURLs      map[string][]string `json:"advertise-client-urls"`
-	InitialAdvertisePeerURLs map[string][]string `json:"initial-advertise-peer-urls"`
-}
-
 func GetSnapshotMatchingName(store brtypes.SnapStore, name string) (*brtypes.Snapshot, error) {
-	snapList, err := store.List()
+	snapList, err := store.List(false)
 	if err != nil {
 		return nil, err
 	}

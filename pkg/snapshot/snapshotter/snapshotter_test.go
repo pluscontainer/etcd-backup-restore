@@ -1,16 +1,6 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package snapshotter_test
 
@@ -31,10 +21,15 @@ import (
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 	"github.com/gardener/etcd-backup-restore/pkg/wrappers"
+	v1 "k8s.io/api/coordination/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/gardener/etcd-backup-restore/test/utils"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 const (
@@ -139,7 +134,7 @@ var _ = Describe("Snapshotter", func() {
 				defer cancel()
 				err = ssr.Run(ctx.Done(), true)
 				Expect(err).Should(HaveOccurred())
-				list, err := store.List()
+				list, err := store.List(false)
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(len(list)).Should(BeZero())
 			})
@@ -177,7 +172,7 @@ var _ = Describe("Snapshotter", func() {
 				})
 
 				It("should not take any snapshot", func() {
-					list, err := store.List()
+					list, err := store.List(false)
 					count := 0
 					for _, snap := range list {
 						if snap.Kind == brtypes.SnapshotKindFull {
@@ -230,7 +225,7 @@ var _ = Describe("Snapshotter", func() {
 						defer cancel()
 						err = ssr.Run(ctx.Done(), true)
 						Expect(err).ShouldNot(HaveOccurred())
-						list, err := store.List()
+						list, err := store.List(false)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(len(list)).ShouldNot(BeZero())
 						for _, snapshot := range list {
@@ -291,7 +286,7 @@ var _ = Describe("Snapshotter", func() {
 							ssrCtx := utils.ContextWithWaitGroup(testCtx, wg)
 							err = ssr.Run(ssrCtx.Done(), false)
 							Expect(err).ShouldNot(HaveOccurred())
-							list, err := store.List()
+							list, err := store.List(false)
 							Expect(err).ShouldNot(HaveOccurred())
 							Expect(len(list)).ShouldNot(BeZero())
 							Expect(list[0].Kind).Should(Equal(brtypes.SnapshotKindDelta))
@@ -325,7 +320,7 @@ var _ = Describe("Snapshotter", func() {
 							err = ssr.Run(ssrCtx.Done(), true)
 
 							Expect(err).ShouldNot(HaveOccurred())
-							list, err := store.List()
+							list, err := store.List(false)
 							Expect(err).ShouldNot(HaveOccurred())
 							Expect(len(list)).ShouldNot(BeZero())
 							Expect(list[0].Kind).Should(Equal(brtypes.SnapshotKindFull))
@@ -378,7 +373,7 @@ var _ = Describe("Snapshotter", func() {
 				defer cancel()
 				ssr.RunGarbageCollector(gcCtx.Done())
 
-				list, err := store.List()
+				list, err := store.List(false)
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(len(list)).Should(Equal(len(expectedSnapList)))
 
@@ -408,7 +403,7 @@ var _ = Describe("Snapshotter", func() {
 				defer cancel()
 				ssr.RunGarbageCollector(gcCtx.Done())
 
-				list, err := store.List()
+				list, err := store.List(false)
 				Expect(err).ShouldNot(HaveOccurred())
 
 				incr := false
@@ -454,7 +449,7 @@ var _ = Describe("Snapshotter", func() {
 				Context("with all delta snapshots older than retention period", func() {
 					It("should delete all delta snapshots", func() {
 						store := prepareStoreWithDeltaSnapshots(testDir, deltaSnapshotCount)
-						list, err := store.List()
+						list, err := store.List(false)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(len(list)).Should(Equal(deltaSnapshotCount))
 
@@ -465,7 +460,7 @@ var _ = Describe("Snapshotter", func() {
 						Expect(err).NotTo(HaveOccurred())
 						Expect(deleted).To(Equal(deltaSnapshotCount))
 
-						list, err = store.List()
+						list, err = store.List(false)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(len(list)).Should(BeZero())
 					})
@@ -474,7 +469,7 @@ var _ = Describe("Snapshotter", func() {
 				Context("with no delta snapshots", func() {
 					It("should not delete any snapshots", func() {
 						store := prepareStoreWithDeltaSnapshots(testDir, 0)
-						list, err := store.List()
+						list, err := store.List(false)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(len(list)).Should(BeZero())
 
@@ -486,7 +481,7 @@ var _ = Describe("Snapshotter", func() {
 						Expect(err).NotTo(HaveOccurred())
 						Expect(deleted).Should(BeZero())
 
-						list, err = store.List()
+						list, err = store.List(false)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(len(list)).Should(BeZero())
 					})
@@ -495,7 +490,7 @@ var _ = Describe("Snapshotter", func() {
 				Context("with all delta snapshots younger than retention period", func() {
 					It("should not delete any snapshots", func() {
 						store := prepareStoreWithDeltaSnapshots(testDir, deltaSnapshotCount)
-						list, err := store.List()
+						list, err := store.List(false)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(len(list)).Should(Equal(6))
 
@@ -507,7 +502,7 @@ var _ = Describe("Snapshotter", func() {
 						Expect(err).NotTo(HaveOccurred())
 						Expect(deleted).Should(BeZero())
 
-						list, err = store.List()
+						list, err = store.List(false)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(len(list)).Should(Equal(deltaSnapshotCount))
 					})
@@ -516,7 +511,7 @@ var _ = Describe("Snapshotter", func() {
 				Context("with a mix of delta snapshots, some older and some younger than retention period", func() {
 					It("should delete only the delta snapshots older than the retention period", func() {
 						store := prepareStoreWithDeltaSnapshots(testDir, deltaSnapshotCount)
-						list, err := store.List()
+						list, err := store.List(false)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(len(list)).Should(Equal(6))
 
@@ -528,9 +523,70 @@ var _ = Describe("Snapshotter", func() {
 						Expect(err).NotTo(HaveOccurred())
 						Expect(deleted).To(Equal(3))
 
-						list, err = store.List()
+						list, err = store.List(false)
 						Expect(err).ShouldNot(HaveOccurred())
 						Expect(len(list)).Should(Equal(3))
+					})
+				})
+				Context("When no error occurs while deletion of delta snapshots", func() {
+					It("Should have no errors and all the snapshots should get deleted", func() {
+						store := prepareStoreWithDeltaSnapshots(testDir, 10)
+						list, err := store.List(false)
+						Expect(err).ShouldNot(HaveOccurred())
+						Expect(len(list)).Should(Equal(10))
+
+						ssr, err := NewSnapshotter(logger, snapshotterConfig, store, etcdConnectionConfig, compressionConfig, healthConfig, snapstoreConfig)
+						Expect(err).ShouldNot(HaveOccurred())
+
+						deleted, err := ssr.GarbageCollectDeltaSnapshots(list)
+						Expect(deleted).Should(Equal(10))
+						Expect(err).ShouldNot(HaveOccurred())
+					})
+				})
+				Context("When an error occurs while deletion of delta snapshot and number of errors are lesser than the threshold(5)", func() {
+					It("should continue with the deletion while joining the errors", func() {
+						store := prepareStoreWithDeltaSnapshots(testDir, 10)
+						list, err := store.List(false)
+						Expect(err).ShouldNot(HaveOccurred())
+						Expect(len(list)).Should(Equal(10))
+
+						ssr, err := NewSnapshotter(logger, snapshotterConfig, store, etcdConnectionConfig, compressionConfig, healthConfig, snapstoreConfig)
+						Expect(err).ShouldNot(HaveOccurred())
+
+						// delete a few snapshots in between to induce an error
+						snapshotsToBeDeleted := []int{7, 5, 3, 2}
+						for _, i := range snapshotsToBeDeleted {
+							err := os.Remove(path.Join(list[i].Prefix, list[i].SnapName))
+							Expect(err).ShouldNot(HaveOccurred())
+						}
+
+						deleted, err := ssr.GarbageCollectDeltaSnapshots(list)
+						Expect(deleted).Should(Equal(6))
+						Expect(err).Should(HaveOccurred())
+					})
+				})
+				Context("When the number of errors while deleting are greater than or equal to the threshold", func() {
+					It("Should halt the process and return", func() {
+						store := prepareStoreWithDeltaSnapshots(testDir, 15)
+						list, err := store.List(false)
+						Expect(err).ShouldNot(HaveOccurred())
+						Expect(len(list)).Should(Equal(15))
+
+						ssr, err := NewSnapshotter(logger, snapshotterConfig, store, etcdConnectionConfig, compressionConfig, healthConfig, snapstoreConfig)
+						Expect(err).ShouldNot(HaveOccurred())
+
+						// This below loop deletes snapshots until the number of deletions reaches the threshold.
+						// This will cause an error when passed into ssr.GarbageCollectDeltaSnapshots for deletion.
+						// Once the count of these individual errors is greater than or equal to the threshold, it errors out.
+						for i := len(list) - 3; i > len(list)-3-DeltaSnapshotGCErrorThreshold-1; i-- {
+							err = os.Remove(path.Join(list[i].Prefix, list[i].SnapName))
+							Expect(err).ShouldNot(HaveOccurred())
+						}
+
+						deleted, err := ssr.GarbageCollectDeltaSnapshots(list)
+						Expect(deleted).Should(Equal(2))
+						Expect(err).Should(HaveOccurred())
+
 					})
 				})
 			})
@@ -570,7 +626,7 @@ var _ = Describe("Snapshotter", func() {
 						Expect(err).NotTo(HaveOccurred())
 						Expect(chunkCount).To(BeZero())
 
-						list, err := store.List()
+						list, err := store.List(false)
 						Expect(err).NotTo(HaveOccurred())
 						Expect(len(list)).To(BeZero())
 
@@ -590,7 +646,7 @@ var _ = Describe("Snapshotter", func() {
 						Expect(err).NotTo(HaveOccurred())
 						Expect(chunkCount).To(Equal(4))
 
-						list, err := store.List()
+						list, err := store.List(false)
 						Expect(err).NotTo(HaveOccurred())
 						Expect(len(list)).To(Equal(4))
 
@@ -626,7 +682,7 @@ var _ = Describe("Snapshotter", func() {
 						Expect(err).NotTo(HaveOccurred())
 						Expect(chunkCount).To(Equal(9))
 
-						list, err := store.List()
+						list, err := store.List(false)
 						Expect(err).NotTo(HaveOccurred())
 						Expect(len(list)).To(Equal(10))
 
@@ -663,7 +719,7 @@ var _ = Describe("Snapshotter", func() {
 						Expect(err).NotTo(HaveOccurred())
 						Expect(chunkCount).To(Equal(9))
 
-						list, err := store.List()
+						list, err := store.List(false)
 						Expect(err).NotTo(HaveOccurred())
 						Expect(len(list)).To(Equal(10))
 
@@ -700,7 +756,7 @@ var _ = Describe("Snapshotter", func() {
 						Expect(err).NotTo(HaveOccurred())
 						Expect(chunkCount).To(BeZero())
 
-						list, err := store.List()
+						list, err := store.List(false)
 						Expect(err).NotTo(HaveOccurred())
 						Expect(len(list)).To(Equal(3))
 
@@ -785,6 +841,22 @@ var _ = Describe("Snapshotter", func() {
 				})
 			})
 
+			Context("Previous full snapshot was not successful", func() {
+				It("should return true", func() {
+					snapshotterConfig := &brtypes.SnapshotterConfig{
+						FullSnapshotSchedule: fmt.Sprintf("%d %d * * *", (currentMin+1)%60, (currentHour+2)%24),
+					}
+
+					ssr, err = NewSnapshotter(logger, snapshotterConfig, store, etcdConnectionConfig, compressionConfig, healthConfig, snapstoreConfig)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					// previous full snapshot wasn't successful
+					ssr.PrevFullSnapshotSucceeded = false
+					isFullSnapMissed := ssr.IsFullSnapshotRequiredAtStartup(fullSnapshotTimeWindow)
+					Expect(isFullSnapMissed).Should(BeTrue())
+				})
+			})
+
 			Context("Previous full snapshot was taken exactly at scheduled snapshot time, no FullSnapshot was missed", func() {
 				It("should return false", func() {
 					snapshotterConfig := &brtypes.SnapshotterConfig{
@@ -798,6 +870,7 @@ var _ = Describe("Snapshotter", func() {
 					ssr.PrevFullSnapshot = &brtypes.Snapshot{
 						CreatedOn: time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day()-1, (currentHour+2)%24, (currentMin+1)%60, 0, 0, time.Local),
 					}
+					ssr.PrevFullSnapshotSucceeded = true
 
 					isFullSnapMissed := ssr.IsFullSnapshotRequiredAtStartup(fullSnapshotTimeWindow)
 					Expect(isFullSnapMissed).Should(BeFalse())
@@ -818,6 +891,7 @@ var _ = Describe("Snapshotter", func() {
 					ssr.PrevFullSnapshot = &brtypes.Snapshot{
 						CreatedOn: time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), (currentHour-4)%24, (currentMin-10)%60, 0, 0, time.Local),
 					}
+					ssr.PrevFullSnapshotSucceeded = true
 					isFullSnapCanBeMissed := ssr.IsFullSnapshotRequiredAtStartup(fullSnapshotTimeWindow)
 					Expect(isFullSnapCanBeMissed).Should(BeFalse())
 				})
@@ -837,6 +911,7 @@ var _ = Describe("Snapshotter", func() {
 					ssr.PrevFullSnapshot = &brtypes.Snapshot{
 						CreatedOn: time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), (currentHour-18)%24, (currentMin)%60, 0, 0, time.Local),
 					}
+					ssr.PrevFullSnapshotSucceeded = true
 					isFullSnapCanBeMissed := ssr.IsFullSnapshotRequiredAtStartup(fullSnapshotTimeWindow)
 					Expect(isFullSnapCanBeMissed).Should(BeTrue())
 				})
@@ -899,6 +974,131 @@ var _ = Describe("Snapshotter", func() {
 
 					timeWindow := ssr.GetFullSnapshotMaxTimeWindow(snapshotterConfig.FullSnapshotSchedule)
 					Expect(timeWindow).Should(Equal(float64(scheduleHour)))
+				})
+			})
+		})
+
+		Describe("Scenarios to update full snapshot lease", func() {
+			var (
+				ssr                             *Snapshotter
+				lease                           *v1.Lease
+				fullSnapshotLeaseStopCh         chan struct{}
+				ctx                             context.Context
+				cancel                          context.CancelFunc
+				fullSnapshotLeaseUpdateInterval time.Duration
+			)
+			BeforeEach(func() {
+				snapstoreConfig = &brtypes.SnapstoreConfig{Container: path.Join(outputDir, "default.bkp")}
+				store, err = snapstore.GetSnapstore(snapstoreConfig)
+				Expect(err).ShouldNot(HaveOccurred())
+
+				Expect(os.Setenv("POD_NAME", "test_pod")).To(Succeed())
+				Expect(os.Setenv("POD_NAMESPACE", "test_namespace")).To(Succeed())
+				lease = &v1.Lease{
+					TypeMeta: metav1.TypeMeta{
+						Kind:       "Lease",
+						APIVersion: "v1",
+					},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      brtypes.DefaultFullSnapshotLeaseName,
+						Namespace: os.Getenv("POD_NAMESPACE"),
+					},
+				}
+				snapshotterConfig := &brtypes.SnapshotterConfig{
+					FullSnapshotSchedule: fmt.Sprintf("%d %d * * *", 0, 0),
+				}
+				ssr, err = NewSnapshotter(logger, snapshotterConfig, store, etcdConnectionConfig, compressionConfig, healthConfig, snapstoreConfig)
+				Expect(err).ShouldNot(HaveOccurred())
+				ssr.PrevFullSnapshot = nil
+				ssr.K8sClientset = fake.NewClientBuilder().Build()
+				ssr.HealthConfig.SnapshotLeaseRenewalEnabled = true
+				fullSnapshotLeaseStopCh = make(chan struct{})
+			})
+			AfterEach(func() {
+				Expect(os.Unsetenv("POD_NAME")).To(Succeed())
+				Expect(os.Unsetenv("POD_NAMESPACE")).To(Succeed())
+			})
+			Context("Without previous full snapshot", func() {
+				It("should not update the lease", func() {
+					ctx, cancel = context.WithCancel(context.Background())
+					defer cancel()
+
+					err := ssr.K8sClientset.Create(ctx, lease)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					fullSnapshotLeaseUpdateInterval = 2 * time.Second
+					go ssr.RenewFullSnapshotLeasePeriodically(fullSnapshotLeaseStopCh, fullSnapshotLeaseUpdateInterval)
+					time.Sleep(2 * time.Second)
+					close(fullSnapshotLeaseStopCh)
+
+					l := &v1.Lease{}
+					Expect(ssr.K8sClientset.Get(ctx, client.ObjectKey{
+						Namespace: lease.Namespace,
+						Name:      lease.Name,
+					}, l)).To(Succeed())
+					Expect(l.Spec.HolderIdentity).To(BeNil())
+				})
+			})
+			Context("With previous full snapshot", func() {
+				It("should be able to fetch and update the full snapshot lease", func() {
+					ctx, cancel = context.WithCancel(context.Background())
+					defer cancel()
+
+					prevFullSnap := &brtypes.Snapshot{
+						Kind:          brtypes.SnapshotKindFull,
+						CreatedOn:     time.Now(),
+						StartRevision: 0,
+						LastRevision:  123,
+					}
+					prevFullSnap.GenerateSnapshotName()
+					ssr.PrevFullSnapshot = prevFullSnap
+					err := ssr.K8sClientset.Create(ctx, lease)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					fullSnapshotLeaseUpdateInterval = time.Second
+					go ssr.RenewFullSnapshotLeasePeriodically(fullSnapshotLeaseStopCh, fullSnapshotLeaseUpdateInterval)
+					time.Sleep(2 * time.Second)
+					close(fullSnapshotLeaseStopCh)
+
+					l := &v1.Lease{}
+					Expect(ssr.K8sClientset.Get(ctx, client.ObjectKey{
+						Namespace: lease.Namespace,
+						Name:      lease.Name,
+					}, l)).To(Succeed())
+					Expect(*l.Spec.HolderIdentity).To(Equal(strconv.FormatInt(prevFullSnap.LastRevision, 10)))
+				})
+				It("should not be able to fetch the lease at first but should be able to update the lease in the next attempt", func() {
+					ctx, cancel = context.WithCancel(context.Background())
+					defer cancel()
+
+					prevFullSnap := &brtypes.Snapshot{
+						Kind:          brtypes.SnapshotKindFull,
+						CreatedOn:     time.Now(),
+						StartRevision: 0,
+						LastRevision:  123,
+					}
+					prevFullSnap.GenerateSnapshotName()
+					ssr.PrevFullSnapshot = prevFullSnap
+					fullSnapshotLeaseUpdateInterval = 3 * time.Second
+					go ssr.RenewFullSnapshotLeasePeriodically(fullSnapshotLeaseStopCh, fullSnapshotLeaseUpdateInterval)
+					time.Sleep(time.Second)
+					err := ssr.K8sClientset.Create(ctx, lease)
+					Expect(err).ShouldNot(HaveOccurred())
+
+					l := &v1.Lease{}
+					Expect(ssr.K8sClientset.Get(ctx, client.ObjectKey{
+						Namespace: lease.Namespace,
+						Name:      lease.Name,
+					}, l)).To(Succeed())
+					Expect(l.Spec.HolderIdentity).To(BeNil())
+					time.Sleep(3 * time.Second)
+
+					Expect(ssr.K8sClientset.Get(ctx, client.ObjectKey{
+						Namespace: lease.Namespace,
+						Name:      lease.Name,
+					}, l)).To(Succeed())
+					Expect(*l.Spec.HolderIdentity).To(Equal(strconv.FormatInt(prevFullSnap.LastRevision, 10)))
+					close(fullSnapshotLeaseStopCh)
 				})
 			})
 		})
@@ -1127,7 +1327,7 @@ func addObjectsToStore(store brtypes.SnapStore, objectType string, kind string, 
 
 // getObjectCount returns counts of chunk and composite objects in the store
 func getObjectCount(store brtypes.SnapStore) (int, int, error) {
-	list, err := store.List()
+	list, err := store.List(false)
 	if err != nil {
 		return 0, 0, err
 	}

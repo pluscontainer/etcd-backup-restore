@@ -1,16 +1,6 @@
-// Copyright (c) 2021 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package types
 
@@ -52,16 +42,28 @@ const (
 	// SnapshotKindChunk is constant for chunk snapshot kind.
 	SnapshotKindChunk = "Chunk"
 
-	// AzureBlobStorageHostName is the host name for azure blob storage service.
-	AzureBlobStorageHostName = "blob.core.windows.net"
+	// AzureBlobStorageGlobalDomain is the default domain for azure blob storage service.
+	AzureBlobStorageGlobalDomain = "blob.core.windows.net"
 
 	// FinalSuffix is the suffix appended to the names of final snapshots.
 	FinalSuffix = ".final"
+
+	// ChunkDirSuffix is the suffix appended to the name of chunk snapshot folder when using fakegcs emulator for testing.
+	// Refer to this github issue for more details: https://github.com/fsouza/fake-gcs-server/issues/1434
+	ChunkDirSuffix = ".chunk"
 
 	backupFormatVersion = "v2"
 
 	// MinChunkSize is set to 5Mib since it is lower chunk size limit for AWS.
 	MinChunkSize int64 = 5 * (1 << 20) //5 MiB
+
+	// ExcludeSnapshotMetadataKey is the tag that is to be added on snapshots in the object store if they are not to be included in SnapStore's List output.
+	ExcludeSnapshotMetadataKey = "x-etcd-snapshot-exclude"
+)
+
+var (
+	// ErrSnapshotDeleteFailDueToImmutability is the error returned when the Delete call fails due to immutability
+	ErrSnapshotDeleteFailDueToImmutability = fmt.Errorf("ErrSnapshotDeleteFailDueToImmutability")
 )
 
 // SnapStore is the interface to be implemented for different
@@ -71,26 +73,41 @@ const (
 type SnapStore interface {
 	// Fetch should open reader for the snapshot file from store.
 	Fetch(Snapshot) (io.ReadCloser, error)
-	// List will return sorted list with all snapshot files on store.
-	List() (SnapList, error)
+	// List returns a sorted list (based on the last revision, ascending) of all snapshots in the store.
+	// includeAll specifies whether to include all snapshots while listing, including those with exclude tags.
+	// Snapshots with exclude tags are not listed unless includeAll is set to true.
+	List(includeAll bool) (SnapList, error)
 	// Save will write the snapshot to store.
 	Save(Snapshot, io.ReadCloser) error
 	// Delete should delete the snapshot file from store.
 	Delete(Snapshot) error
 }
 
-// Snapshot structure represents the metadata of snapshot.s
+// Snapshot structure represents the metadata of snapshot.
 type Snapshot struct {
-	Kind              string    `json:"kind"` //incr:incremental,full:full
-	StartRevision     int64     `json:"startRevision"`
-	LastRevision      int64     `json:"lastRevision"` //latest revision on snapshot
-	CreatedOn         time.Time `json:"createdOn"`
-	SnapDir           string    `json:"snapDir"`
-	SnapName          string    `json:"snapName"`
-	IsChunk           bool      `json:"isChunk"`
-	Prefix            string    `json:"prefix"`            // Points to correct prefix of a snapshot in snapstore (Required for Backward Compatibility)
-	CompressionSuffix string    `json:"compressionSuffix"` // CompressionSuffix depends on compessionPolicy
-	IsFinal           bool      `json:"isFinal"`
+	Kind                   string    `json:"kind"` // incr:incremental, full:full
+	StartRevision          int64     `json:"startRevision"`
+	LastRevision           int64     `json:"lastRevision"` // latest revision on snapshot
+	CreatedOn              time.Time `json:"createdOn"`
+	SnapDir                string    `json:"snapDir"`
+	SnapName               string    `json:"snapName"`
+	IsChunk                bool      `json:"isChunk"`
+	Prefix                 string    `json:"prefix"`            // Points to correct prefix of a snapshot in snapstore (Required for Backward Compatibility)
+	CompressionSuffix      string    `json:"compressionSuffix"` // CompressionSuffix depends on compression policy
+	IsFinal                bool      `json:"isFinal"`
+	ImmutabilityExpiryTime time.Time `json:"immutabilityExpriyTime"`
+}
+
+// IsDeletable determines if the snapshot can be deleted.
+// It checks if the immutability expiry time is set and whether the current time is after the immutability expiry time.
+func (s *Snapshot) IsDeletable() bool {
+	// Check if ImmutabilityExpiryTime is the zero value of time.Time, which means it is not set.
+	// If ImmutabilityExpiryTime is not set, assume the snapshot can be deleted.
+	if s.ImmutabilityExpiryTime.IsZero() {
+		return true
+	}
+	// Otherwise, check if the current time is after the immutability expiry time.
+	return time.Now().After(s.ImmutabilityExpiryTime)
 }
 
 // GenerateSnapshotName prepares the snapshot name from metadata

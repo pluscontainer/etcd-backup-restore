@@ -1,16 +1,6 @@
-// Copyright (c) 2019 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package snapstore
 
@@ -226,7 +216,7 @@ func (s *OSSSnapStore) uploadPart(imur oss.InitiateMultipartUploadResult, file *
 }
 
 // List will return sorted list with all snapshot files on store.
-func (s *OSSSnapStore) List() (brtypes.SnapList, error) {
+func (s *OSSSnapStore) List(_ bool) (brtypes.SnapList, error) {
 	prefixTokens := strings.Split(s.prefix, "/")
 	// Last element of the tokens is backup version
 	// Consider the parent of the backup version level (Required for Backward Compatibility)
@@ -268,19 +258,35 @@ func (s *OSSSnapStore) Delete(snap brtypes.Snapshot) error {
 }
 
 func getAuthOptions(prefix string) (*authOptions, error) {
-
 	if filename, isSet := os.LookupEnv(prefix + aliCredentialJSONFile); isSet {
 		ao, err := readALICredentialsJSON(filename)
 		if err != nil {
-			return nil, fmt.Errorf("error getting credentials using %v file", filename)
+			return nil, fmt.Errorf("error getting credentials using %v file with error: %w", filename, err)
 		}
 		return ao, nil
+	}
+
+	// TODO: @renormalize Remove this extra handling in v0.31.0
+	// Check if a JSON file is present in the directory, if it is present -> the JSON file must be used for credentials.
+	if dir, isSet := os.LookupEnv(prefix + aliCredentialDirectory); isSet {
+		jsonCredentialFile, err := findFileWithExtensionInDir(dir, ".json")
+		if err != nil {
+			return nil, fmt.Errorf("error while finding a JSON credential file in %v directory with error: %w", dir, err)
+		}
+		if jsonCredentialFile != "" {
+			ao, err := readALICredentialsJSON(jsonCredentialFile)
+			if err != nil {
+				return nil, fmt.Errorf("error getting credentials using %v JSON file in a directory with error: %w", jsonCredentialFile, err)
+			}
+			return ao, nil
+		}
+		// Non JSON credential files might exist in the credential directory, do not return
 	}
 
 	if dir, isSet := os.LookupEnv(prefix + aliCredentialDirectory); isSet {
 		ao, err := readALICredentialFiles(dir)
 		if err != nil {
-			return nil, fmt.Errorf("error getting credentials from %v directory", dir)
+			return nil, fmt.Errorf("error getting credentials from %v directory with error: %w", dir, err)
 		}
 		return ao, nil
 	}
@@ -345,6 +351,19 @@ func readALICredentialFiles(dirname string) (*authOptions, error) {
 
 // GetOSSCredentialsLastModifiedTime returns the latest modification timestamp of the OSS credential file(s)
 func GetOSSCredentialsLastModifiedTime() (time.Time, error) {
+	// TODO: @renormalize Remove this extra handling in v0.31.0
+	// Check if a JSON file is present in the directory, if it is present -> the JSON file must be used for credentials.
+	if dir, isSet := os.LookupEnv(aliCredentialDirectory); isSet {
+		modificationTimeStamp, err := getJSONCredentialModifiedTime(dir)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to fetch credential modification time for OSS with error: %w", err)
+		}
+		if !modificationTimeStamp.IsZero() {
+			return modificationTimeStamp, nil
+		}
+		// Non JSON credential files might exist in the credential directory, do not return
+	}
+
 	if dir, isSet := os.LookupEnv(aliCredentialDirectory); isSet {
 		// credential files which are essential for creating the OSS snapstore
 		credentialFiles := []string{"accessKeyID", "accessKeySecret", "storageEndpoint"}

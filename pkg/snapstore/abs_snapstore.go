@@ -1,16 +1,6 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package snapstore
 
@@ -20,17 +10,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/sirupsen/logrus"
+	"k8s.io/utils/ptr"
 
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 )
@@ -38,12 +36,53 @@ import (
 const (
 	absCredentialDirectory = "AZURE_APPLICATION_CREDENTIALS"
 	absCredentialJSONFile  = "AZURE_APPLICATION_CREDENTIALS_JSON"
+	// AzuriteEndpoint is the environment variable which indicates the endpoint at which the Azurite emulator is hosted
+	AzuriteEndpoint = "AZURE_STORAGE_API_ENDPOINT"
 )
+
+// AzureBlockBlobClientI defines the methods that are invoked from the Azure Block Blob API.
+type AzureBlockBlobClientI interface {
+	// DownloadStream reads a range of bytes from a blob. The response also includes the blob's properties and metadata.
+	DownloadStream(context.Context, *blob.DownloadStreamOptions) (blob.DownloadStreamResponse, error)
+	// Delete marks the specified blob or snapshot for deletion. The blob is later deleted during the internal garbage collection of Azure Blob Storage.
+	// Note that deleting a blob also deletes all its snapshots.
+	Delete(context.Context, *blob.DeleteOptions) (blob.DeleteResponse, error)
+	// CommitBlockList writes a blob by specifying the list of block IDs that make up the blob.
+	// In order to be written as part of a blob, a block must have been successfully written
+	// to the server in a prior PutBlock operation. You can call PutBlockList to update a blob
+	// by uploading only those blocks that have changed, then committing the new and existing
+	// blocks together. Any blocks not specified in the block list and permanently deleted.
+	CommitBlockList(context.Context, []string, *blockblob.CommitBlockListOptions) (blockblob.CommitBlockListResponse, error)
+	// StageBlock uploads the specified block to the block blob's "staging area" to be later committed by a call to CommitBlockList.
+	StageBlock(context.Context, string, io.ReadSeekCloser, *blockblob.StageBlockOptions) (blockblob.StageBlockResponse, error)
+}
+
+// azureContainerClientI defines the methods required for container operations.
+type azureContainerClientI interface {
+	// NewListBlobsFlatPager returns a pager for blobs starting from the specified Marker. Use an empty
+	// Marker to start enumeration from the beginning. Blob names are returned in lexicographic order.
+	NewListBlobsFlatPager(*container.ListBlobsFlatOptions) *runtime.Pager[container.ListBlobsFlatResponse]
+	// NewBlockBlobClient creates a new blockblob.Client object by concatenating blobName to the end of
+	// this Client's URL. The blob name will be URL-encoded.
+	// The new blockblob.Client uses the same request policy pipeline as this Client.
+	NewBlockBlobClient(string) AzureBlockBlobClientI
+}
+
+// AzureContainerClient embeds an azure *container.Client (its methods are overridden in tests).
+type AzureContainerClient struct {
+	*container.Client
+}
+
+// NewBlockBlobClient simply returns the BlockBlobClient that the embeded *azcontainer.Client returns.
+func (a *AzureContainerClient) NewBlockBlobClient(blobName string) AzureBlockBlobClientI {
+	return a.Client.NewBlockBlobClient(blobName)
+}
 
 // ABSSnapStore is an ABS backed snapstore.
 type ABSSnapStore struct {
-	containerURL *azblob.ContainerURL
-	prefix       string
+	container string
+	client    azureContainerClientI
+	prefix    string
 	// maxParallelChunkUploads hold the maximum number of parallel chunk uploads allowed.
 	maxParallelChunkUploads uint
 	minChunkSize            int64
@@ -51,56 +90,116 @@ type ABSSnapStore struct {
 }
 
 type absCredentials struct {
-	BucketName     string `json:"bucketName"`
-	SecretKey      string `json:"storageKey"`
-	StorageAccount string `json:"storageAccount"`
+	BucketName     string  `json:"bucketName"`
+	StorageAccount string  `json:"storageAccount"`
+	StorageKey     string  `json:"storageKey"`
+	Domain         *string `json:"domain,omitempty"`
 }
 
-// NewABSSnapStore create new ABSSnapStore from shared configuration with specified bucket
+// NewABSSnapStore creates a new ABSSnapStore using a shared configuration and a specified bucket
 func NewABSSnapStore(config *brtypes.SnapstoreConfig) (*ABSSnapStore, error) {
-	storageAccount, storageKey, err := getCredentials(getEnvPrefixString(config.IsSource))
+	absCreds, err := getCredentials(getEnvPrefixString(config.IsSource))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get credentials: %w", err)
 	}
 
-	credentials, err := azblob.NewSharedKeyCredential(storageAccount, storageKey)
+	sharedKeyCredential, err := container.NewSharedKeyCredential(absCreds.StorageAccount, absCreds.StorageKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create shared key credentials: %v", err)
+		return nil, fmt.Errorf("failed to create sharedKeyCredential: %w", err)
 	}
 
-	p := azblob.NewPipeline(credentials, azblob.PipelineOptions{
-		Retry: azblob.RetryOptions{
-			TryTimeout: downloadTimeout,
-		}})
-	u, err := url.Parse(fmt.Sprintf("https://%s.%s", storageAccount, brtypes.AzureBlobStorageHostName))
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse service url: %v", err)
+	domain := brtypes.AzureBlobStorageGlobalDomain
+	if absCreds.Domain != nil {
+		domain = *absCreds.Domain
 	}
-	serviceURL := azblob.NewServiceURL(*u, p)
-	containerURL := serviceURL.NewContainerURL(config.Container)
 
-	return GetABSSnapstoreFromClient(config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads, config.MinChunkSize, &containerURL)
+	blobServiceURL, err := ConstructBlobServiceURL(absCreds.StorageAccount, domain)
+	if err != nil {
+		return nil, fmt.Errorf("failed to construct the blob service URL with error: %w", err)
+	}
+	containerURL := fmt.Sprintf("%s/%s", blobServiceURL, config.Container)
+
+	client, err := container.NewClientWithSharedKeyCredential(containerURL, sharedKeyCredential, &container.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Retry: policy.RetryOptions{
+				TryTimeout: downloadTimeout,
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client with shared key credential with error: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), providerConnectionTimeout)
+	defer cancel()
+
+	if _, err := client.GetProperties(ctx, nil); err != nil {
+		if bloberror.HasCode(err, bloberror.ContainerNotFound) {
+			return nil, fmt.Errorf("container %s does not exist", config.Container)
+		}
+		return nil, fmt.Errorf("failed to get properties of the container %v with error: %w", config.Container, err)
+	}
+
+	return NewABSSnapStoreFromClient(config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads, config.MinChunkSize, &AzureContainerClient{client}), nil
 }
 
-func getCredentials(prefixString string) (string, string, error) {
+// ConstructBlobServiceURL constructs the Blob Service URL based on the activation status of the Azurite Emulator.
+// It checks the environment variable for emulator configuration and constructs the URL accordingly.
+// The function expects the following environment variable:
+// - AZURE_EMULATOR_ENABLED: Indicates whether the Azurite Emulator is enabled (expects "true" or "false").
+func ConstructBlobServiceURL(storageAccount, domain string) (string, error) {
+	scheme := "https"
 
+	emulatorEnabled, ok := os.LookupEnv(EnvAzureEmulatorEnabled)
+	if ok {
+		isEmulator, err := strconv.ParseBool(emulatorEnabled)
+		if err != nil {
+			return "", fmt.Errorf("invalid value for %s: %s, error: %w", EnvAzureEmulatorEnabled, emulatorEnabled, err)
+		}
+		if isEmulator {
+			// TODO: going forward, use Azurite with HTTPS (TLS) communication
+			scheme = "http"
+		}
+	}
+
+	return fmt.Sprintf("%s://%s.%s", scheme, storageAccount, domain), nil
+}
+
+func getCredentials(prefixString string) (*absCredentials, error) {
 	if filename, isSet := os.LookupEnv(prefixString + absCredentialJSONFile); isSet {
 		credentials, err := readABSCredentialsJSON(filename)
 		if err != nil {
-			return "", "", fmt.Errorf("error getting credentials using %v file", filename)
+			return nil, fmt.Errorf("error getting credentials using %v file with error %w", filename, err)
 		}
-		return credentials.StorageAccount, credentials.SecretKey, nil
+		return credentials, nil
+	}
+
+	// TODO: @renormalize Remove this extra handling in v0.31.0
+	// Check if a JSON file is present in the directory, if it is present -> the JSON file must be used for credentials.
+	if dir, isSet := os.LookupEnv(prefixString + absCredentialDirectory); isSet {
+		jsonCredentialFile, err := findFileWithExtensionInDir(dir, ".json")
+		if err != nil {
+			return nil, fmt.Errorf("error while finding a JSON credential file in %v directory with error: %w", dir, err)
+		}
+		if jsonCredentialFile != "" {
+			credentials, err := readABSCredentialsJSON(jsonCredentialFile)
+			if err != nil {
+				return nil, fmt.Errorf("error getting credentials using %v JSON file in a directory with error: %w", jsonCredentialFile, err)
+			}
+			return credentials, nil
+		}
+		// Non JSON credential files might exist in the credential directory, do not return
 	}
 
 	if dir, isSet := os.LookupEnv(prefixString + absCredentialDirectory); isSet {
 		credentials, err := readABSCredentialFiles(dir)
 		if err != nil {
-			return "", "", fmt.Errorf("error getting credentials from %v dir", dir)
+			return nil, fmt.Errorf("error getting credentials from %v directory with error %w", dir, err)
 		}
-		return credentials.StorageAccount, credentials.SecretKey, nil
+		return credentials, nil
 	}
 
-	return "", "", fmt.Errorf("unable to get credentials")
+	return nil, fmt.Errorf("unable to get credentials")
 }
 
 func readABSCredentialsJSON(filename string) (*absCredentials, error) {
@@ -121,7 +220,6 @@ func absCredentialsFromJSON(jsonData []byte) (*absCredentials, error) {
 
 	return absConfig, nil
 }
-
 func readABSCredentialFiles(dirname string) (*absCredentials, error) {
 	absConfig := &absCredentials{}
 
@@ -132,17 +230,23 @@ func readABSCredentialFiles(dirname string) (*absCredentials, error) {
 
 	for _, file := range files {
 		if file.Name() == "storageAccount" {
-			data, err := os.ReadFile(dirname + "/storageAccount")
+			data, err := os.ReadFile(path.Join(dirname, file.Name()))
 			if err != nil {
 				return nil, err
 			}
 			absConfig.StorageAccount = string(data)
 		} else if file.Name() == "storageKey" {
-			data, err := os.ReadFile(dirname + "/storageKey")
+			data, err := os.ReadFile(path.Join(dirname, file.Name()))
 			if err != nil {
 				return nil, err
 			}
-			absConfig.SecretKey = string(data)
+			absConfig.StorageKey = string(data)
+		} else if file.Name() == "domain" {
+			data, err := os.ReadFile(path.Join(dirname, file.Name()))
+			if err != nil {
+				return nil, err
+			}
+			absConfig.Domain = ptr.To(string(data))
 		}
 	}
 
@@ -152,72 +256,83 @@ func readABSCredentialFiles(dirname string) (*absCredentials, error) {
 	return absConfig, nil
 }
 
-// GetABSSnapstoreFromClient returns a new ABS object for a given container using the supplied storageClient
-func GetABSSnapstoreFromClient(container, prefix, tempDir string, maxParallelChunkUploads uint, minChunkSize int64, containerURL *azblob.ContainerURL) (*ABSSnapStore, error) {
-	// Check if supplied container exists
-	ctx, cancel := context.WithTimeout(context.TODO(), providerConnectionTimeout)
-	defer cancel()
-	_, err := containerURL.GetProperties(ctx, azblob.LeaseAccessConditions{})
-	if err != nil {
-		aer, ok := err.(azblob.StorageError)
-		if !ok {
-			return nil, fmt.Errorf("failed to get properties of container %v with err, %v", container, err.Error())
-		}
-		if aer.ServiceCode() != azblob.ServiceCodeContainerNotFound {
-			return nil, fmt.Errorf("failed to get properties of container %v with err, %v", container, aer.Error())
-		}
-		return nil, fmt.Errorf("container %s does not exist", container)
-	}
+// NewABSSnapStoreFromClient returns a new ABS object for a given container using the supplied storageClient
+func NewABSSnapStoreFromClient(container, prefix, tempDir string, maxParallelChunkUploads uint, minChunkSize int64, client azureContainerClientI) *ABSSnapStore {
 	return &ABSSnapStore{
-		prefix:                  prefix,
-		containerURL:            containerURL,
-		maxParallelChunkUploads: maxParallelChunkUploads,
-		minChunkSize:            minChunkSize,
-		tempDir:                 tempDir,
-	}, nil
+		container,
+		client,
+		prefix,
+		maxParallelChunkUploads,
+		minChunkSize,
+		tempDir,
+	}
 }
 
 // Fetch should open reader for the snapshot file from store
 func (a *ABSSnapStore) Fetch(snap brtypes.Snapshot) (io.ReadCloser, error) {
 	blobName := path.Join(snap.Prefix, snap.SnapDir, snap.SnapName)
-	blob := a.containerURL.NewBlobURL(blobName)
-	resp, err := blob.Download(context.Background(), io.SeekStart, azblob.CountToEnd, azblob.BlobAccessConditions{}, false)
+
+	blobClient := a.client.NewBlockBlobClient(blobName)
+
+	streamResp, err := blobClient.DownloadStream(context.Background(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to download the blob %s with error:%v", blobName, err)
+		return nil, fmt.Errorf("failed to download the blob %s with error: %w", blobName, err)
 	}
-	return resp.Body(azblob.RetryReaderOptions{}), nil
+
+	return streamResp.Body, nil
 }
 
 // List will return sorted list with all snapshot files on store.
-func (a *ABSSnapStore) List() (brtypes.SnapList, error) {
+func (a *ABSSnapStore) List(includeAll bool) (brtypes.SnapList, error) {
 	prefixTokens := strings.Split(a.prefix, "/")
 	// Last element of the tokens is backup version
 	// Consider the parent of the backup version level (Required for Backward Compatibility)
 	prefix := path.Join(strings.Join(prefixTokens[:len(prefixTokens)-1], "/"))
 	var snapList brtypes.SnapList
-	opts := azblob.ListBlobsSegmentOptions{Prefix: prefix}
-	for marker := (azblob.Marker{}); marker.NotDone(); {
-		// Get a result segment starting with the blob indicated by the current Marker.
-		listBlob, err := a.containerURL.ListBlobsFlatSegment(context.TODO(), marker, opts)
-		if err != nil {
-			return nil, fmt.Errorf("failed to list the blobs, error: %v", err)
-		}
-		marker = listBlob.NextMarker
 
-		// Process the blobs returned in this result segment
-		for _, blob := range listBlob.Segment.BlobItems {
-			if strings.Contains(blob.Name, backupVersionV1) || strings.Contains(blob.Name, backupVersionV2) {
-				//the blob may contain the full path in its name including the prefix
-				blobName := strings.TrimPrefix(blob.Name, prefix)
-				s, err := ParseSnapshot(path.Join(prefix, blobName))
+	// Prefix is compulsory here, since the container could potentially be used by other instances of etcd-backup-restore
+	pager := a.client.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{Prefix: &prefix,
+		Include: container.ListBlobsInclude{
+			Metadata:           true,
+			Tags:               true,
+			Versions:           true,
+			ImmutabilityPolicy: true,
+		},
+	})
+	for pager.More() {
+		resp, err := pager.NextPage(context.Background())
+		if err != nil {
+			return nil, fmt.Errorf("failed to list the blobs, error: %w", err)
+		}
+
+	blob:
+		for _, blobItem := range resp.Segment.BlobItems {
+			// process the blobs returned in the result segment
+			if strings.Contains(*blobItem.Name, backupVersionV1) || strings.Contains(*blobItem.Name, backupVersionV2) {
+				snapshot, err := ParseSnapshot(*blobItem.Name)
 				if err != nil {
-					logrus.Warnf("Invalid snapshot found. Ignoring it:%s\n", blob.Name)
+					logrus.Warnf("Invalid snapshot found. Ignoring: %s", *blobItem.Name)
 				} else {
-					snapList = append(snapList, s)
+					// Tagged snapshots are not listed when excluded, e.g. during restoration
+					if blobItem.BlobTags != nil {
+						for _, tag := range blobItem.BlobTags.BlobTagSet {
+							// skip this blob
+							if !includeAll && (*tag.Key == brtypes.ExcludeSnapshotMetadataKey && *tag.Value == "true") {
+								logrus.Infof("Ignoring snapshot %s due to the exclude tag %q in the snapshot metadata", snapshot.SnapName, *tag.Key)
+								continue blob
+							}
+						}
+					}
+					// nil check only necessary for Azurite
+					if blobItem.Properties.ImmutabilityPolicyExpiresOn != nil {
+						snapshot.ImmutabilityExpiryTime = *blobItem.Properties.ImmutabilityPolicyExpiresOn
+					}
+					snapList = append(snapList, snapshot)
 				}
 			}
 		}
 	}
+
 	sort.Sort(snapList)
 	return snapList, nil
 }
@@ -228,7 +343,7 @@ func (a *ABSSnapStore) Save(snap brtypes.Snapshot, rc io.ReadCloser) error {
 	tmpfile, err := os.CreateTemp(a.tempDir, tmpBackupFilePrefix)
 	if err != nil {
 		rc.Close()
-		return fmt.Errorf("failed to create snapshot tempfile: %v", err)
+		return fmt.Errorf("failed to create snapshot tempfile: %w", err)
 	}
 	defer func() {
 		tmpfile.Close()
@@ -237,7 +352,7 @@ func (a *ABSSnapStore) Save(snap brtypes.Snapshot, rc io.ReadCloser) error {
 	size, err := io.Copy(tmpfile, rc)
 	rc.Close()
 	if err != nil {
-		return fmt.Errorf("failed to save snapshot to tmpfile: %v", err)
+		return fmt.Errorf("failed to save snapshot to tmpfile: %w", err)
 	}
 
 	var (
@@ -273,22 +388,23 @@ func (a *ABSSnapStore) Save(snap brtypes.Snapshot, rc io.ReadCloser) error {
 
 	snapshotErr := collectChunkUploadError(chunkUploadCh, resCh, cancelCh, noOfChunks)
 	wg.Wait()
-
 	if snapshotErr != nil {
-		return fmt.Errorf("failed uploading chunk, id: %d, offset: %d, error: %v", snapshotErr.chunk.id, snapshotErr.chunk.offset, snapshotErr.err)
+		return fmt.Errorf("failed uploading chunk, id: %d, offset: %d, error: %w", snapshotErr.chunk.id, snapshotErr.chunk.offset, snapshotErr.err)
 	}
 	logrus.Info("All chunk uploaded successfully. Uploading blocklist.")
+
 	blobName := path.Join(adaptPrefix(&snap, a.prefix), snap.SnapDir, snap.SnapName)
-	blob := a.containerURL.NewBlockBlobURL(blobName)
 	var blockList []string
 	for partNumber := int64(1); partNumber <= noOfChunks; partNumber++ {
 		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%010d", partNumber)))
 		blockList = append(blockList, blockID)
 	}
+
+	blobClient := a.client.NewBlockBlobClient(blobName)
 	ctx, cancel := context.WithTimeout(context.TODO(), chunkUploadTimeout)
 	defer cancel()
-	if _, err := blob.CommitBlockList(ctx, blockList, azblob.BlobHTTPHeaders{}, azblob.Metadata{}, azblob.BlobAccessConditions{}); err != nil {
-		return fmt.Errorf("failed uploading blocklist for snapshot with error: %v", err)
+	if _, err := blobClient.CommitBlockList(ctx, blockList, nil); err != nil {
+		return fmt.Errorf("failed uploading blocklist for snapshot with error: %w", err)
 	}
 	logrus.Info("Blocklist uploaded successfully.")
 	return nil
@@ -307,15 +423,17 @@ func (a *ABSSnapStore) uploadBlock(snap *brtypes.Snapshot, file *os.File, offset
 
 	sr := io.NewSectionReader(file, offset, size)
 	blobName := path.Join(adaptPrefix(snap, a.prefix), snap.SnapDir, snap.SnapName)
-	blob := a.containerURL.NewBlockBlobURL(blobName)
 	partNumber := ((offset / chunkSize) + 1)
 	blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%010d", partNumber)))
+
 	ctx, cancel := context.WithTimeout(context.TODO(), chunkUploadTimeout)
 	defer cancel()
-	var transactionMD5 []byte
-	if _, err := blob.StageBlock(ctx, blockID, sr, azblob.LeaseAccessConditions{}, transactionMD5); err != nil {
-		return fmt.Errorf("failed to upload chunk offset: %d, blob: %s, error: %v", offset, blobName, err)
+
+	blobClient := a.client.NewBlockBlobClient(blobName)
+	if _, err := blobClient.StageBlock(ctx, blockID, streaming.NopCloser(sr), nil); err != nil {
+		return fmt.Errorf("failed to upload chunk offset: %d, blob: %s, error: %w", offset, blobName, err)
 	}
+
 	return nil
 }
 
@@ -342,15 +460,30 @@ func (a *ABSSnapStore) blockUploader(wg *sync.WaitGroup, stopCh <-chan struct{},
 // Delete should delete the snapshot file from store
 func (a *ABSSnapStore) Delete(snap brtypes.Snapshot) error {
 	blobName := path.Join(snap.Prefix, snap.SnapDir, snap.SnapName)
-	blob := a.containerURL.NewBlobURL(blobName)
-	if _, err := blob.Delete(context.TODO(), azblob.DeleteSnapshotsOptionInclude, azblob.BlobAccessConditions{}); err != nil {
-		return fmt.Errorf("failed to delete blob %s with error: %v", blobName, err)
+	blobClient := a.client.NewBlockBlobClient(blobName)
+	if _, err := blobClient.Delete(context.Background(), nil); bloberror.HasCode(err, bloberror.BlobImmutableDueToPolicy) {
+		return fmt.Errorf("failed to delete blob %s due to immutability: %w, with provider error: %w", blobName, brtypes.ErrSnapshotDeleteFailDueToImmutability, err)
+	} else if err != nil {
+		return fmt.Errorf("failed to delete blob %s with error: %w", blobName, err)
 	}
 	return nil
 }
 
 // GetABSCredentialsLastModifiedTime returns the latest modification timestamp of the ABS credential file(s)
 func GetABSCredentialsLastModifiedTime() (time.Time, error) {
+	// TODO: @renormalize Remove this extra handling in v0.31.0
+	// Check if a JSON file is present in the directory, if it is present -> the JSON file must be used for credentials.
+	if dir, isSet := os.LookupEnv(absCredentialDirectory); isSet {
+		modificationTimeStamp, err := getJSONCredentialModifiedTime(dir)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to fetch credential modification time for ABS with error: %w", err)
+		}
+		if !modificationTimeStamp.IsZero() {
+			return modificationTimeStamp, nil
+		}
+		// Non JSON credential files might exist in the credential directory, do not return
+	}
+
 	if dir, isSet := os.LookupEnv(absCredentialDirectory); isSet {
 		// credential files which are essential for creating the snapstore
 		credentialFiles := []string{"storageKey", "storageAccount"}
@@ -359,7 +492,7 @@ func GetABSCredentialsLastModifiedTime() (time.Time, error) {
 		}
 		absTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
 		if err != nil {
-			return time.Time{}, fmt.Errorf("failed to get ABS credential timestamp from the directory %v with error: %v", dir, err)
+			return time.Time{}, fmt.Errorf("failed to get ABS credential timestamp from the directory %v with error: %w", dir, err)
 		}
 		return absTimeStamp, nil
 	}
@@ -368,7 +501,7 @@ func GetABSCredentialsLastModifiedTime() (time.Time, error) {
 		credentialFiles := []string{filename}
 		absTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
 		if err != nil {
-			return time.Time{}, fmt.Errorf("failed to fetch file information of the ABS JSON credential file %v with error: %v", filename, err)
+			return time.Time{}, fmt.Errorf("failed to fetch file information of the ABS JSON credential file %v with error: %w", filename, err)
 		}
 		return absTimeStamp, nil
 	}
@@ -377,7 +510,7 @@ func GetABSCredentialsLastModifiedTime() (time.Time, error) {
 }
 
 func isABSConfigEmpty(config *absCredentials) error {
-	if len(config.SecretKey) != 0 && len(config.StorageAccount) != 0 {
+	if len(config.StorageKey) != 0 && len(config.StorageAccount) != 0 {
 		return nil
 	}
 	return fmt.Errorf("azure object storage credentials: storageKey or storageAccount is missing")

@@ -1,17 +1,7 @@
 #!/usr/bin/env bash
-# Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+# SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 set -e
 
 # For the test step concourse will set the following environment variables:
@@ -40,6 +30,9 @@ TM_TEST_ID_PREFIX="etcdbr-tm-test"
 
 export GOBIN="${SOURCE_PATH}/bin"
 export PATH="${GOBIN}:${PATH}"
+# AWS_PAGER set to empty string to fix "Unable to redirect output to pager" error
+# https://stackoverflow.com/questions/57953187/aws-cli-has-no-output/68361849#68361849
+export AWS_PAGER=""
 cd "${SOURCE_PATH}"
 
 if [ "$USE_CC_SERVER_CACHE" == true ] ; then
@@ -70,17 +63,17 @@ function setup_test_environment() {
 
 function setup_ginkgo() {
     echo "Installing Ginkgo..."
-    go install github.com/onsi/ginkgo/ginkgo@v1.14.1
+    go install github.com/onsi/ginkgo/ginkgo@v1.14.1 > /dev/null 2>&1
     ginkgo version
     echo "Successfully installed Ginkgo."
 }
 
 function setup_etcd(){
   echo "Downloading and installing etcd..."
-  export ETCD_VER=v3.4.13
+  export ETCD_VER=v3.4.34
   if [[ $(uname) == 'Darwin' ]]; then
     curl -L https://storage.googleapis.com/etcd/${ETCD_VER}/etcd-${ETCD_VER}-darwin-amd64.zip -o etcd-${ETCD_VER}-darwin-amd64.zip
-    unzip etcd-${ETCD_VER}-darwin-amd64.zip
+    unzip etcd-${ETCD_VER}-darwin-amd64.zip > /dev/null
     chmod +x ./etcd-${ETCD_VER}-darwin-amd64/etcd
     chmod +x ./etcd-${ETCD_VER}-darwin-amd64/etcdctl
     mv ./etcd-${ETCD_VER}-darwin-amd64/etcdctl ${GOBIN}/etcdctl
@@ -89,7 +82,7 @@ function setup_etcd(){
     rm -rf etcd-${ETCD_VER}-darwin-amd64.zip
   else
     curl -L https://storage.googleapis.com/etcd/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz -o etcd-${ETCD_VER}-linux-amd64.tar.gz
-    tar xzvf etcd-${ETCD_VER}-linux-amd64.tar.gz
+    tar xzvf etcd-${ETCD_VER}-linux-amd64.tar.gz > /dev/null
     chmod +x ./etcd-${ETCD_VER}-linux-amd64/etcd
     chmod +x ./etcd-${ETCD_VER}-linux-amd64/etcdctl
     mv ./etcd-${ETCD_VER}-linux-amd64/etcdctl ${GOBIN}/etcdctl
@@ -102,19 +95,34 @@ function setup_etcd(){
 
 function setup_etcdbrctl(){
     echo "Installing etcdbrctl..."
-    GO111MODULE=on go build \
+    go build \
     -v \
     -o ${GOBIN}/etcdbrctl \
     -ldflags "-w -X ${REPOSITORY}/pkg/version.Version=${VERSION}" \
     -mod=vendor \
-    main.go
+    main.go > /dev/null 2>&1
     chmod +x ${GOBIN}/etcdbrctl
     echo "Successfully installed etcdbrctl."
 }
 
+# More information at https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
 function setup_awscli() {
+    if command -v aws > /dev/null; then
+      return
+    fi
     echo "Installing awscli..."
-    pip3 install --break-system-packages awscli
+    # apt since the golang image that runs the integration tests is debian based
+    if [[ $(uname) == 'Linux' ]]; then
+      apt update && apt install -y curl unzip > /dev/null
+      curl "https://awscli.amazonaws.com/awscli-exe-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m).zip" -o "awscliv2.zip" > /dev/null
+      unzip awscliv2.zip > /dev/null
+      ./aws/install -i /usr/local/aws-cli -b /usr/local/bin
+      rm -rf awscliv2.zip aws
+    else
+      curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "AWSCLIV2.pkg"
+      sudo installer -pkg AWSCLIV2.pkg -target /
+      rm -rf AWSCLIV2.pkg
+    fi
     echo "Successfully installed awscli."
 }
 
@@ -168,10 +176,12 @@ EOF
 }
 
 function create_aws_secret() {
+  apt update && apt install -y pip > /dev/null
+  pip install --break-system-packages gardener-cicd-cli > /dev/null
   echo "Fetching aws credentials from secret server..."
-  export ACCESS_KEY_ID=`/cc/utils/cli.py config $CC_CACHE_FILE_FLAG attribute --cfg-type aws --cfg-name etcd-backup-restore --key access_key_id`
-  export SECRET_ACCESS_KEY=`/cc/utils/cli.py config $CC_CACHE_FILE_FLAG attribute --cfg-type aws --cfg-name etcd-backup-restore --key secret_access_key`
-  export REGION=`/cc/utils/cli.py config $CC_CACHE_FILE_FLAG attribute --cfg-type aws --cfg-name etcd-backup-restore --key region`
+  export ACCESS_KEY_ID=`gardener-ci config $CC_CACHE_FILE_FLAG attribute --cfg-type aws --cfg-name etcd-backup-restore --key access_key_id`
+  export SECRET_ACCESS_KEY=`gardener-ci config $CC_CACHE_FILE_FLAG attribute --cfg-type aws --cfg-name etcd-backup-restore --key secret_access_key`
+  export REGION=`gardener-ci config $CC_CACHE_FILE_FLAG attribute --cfg-type aws --cfg-name etcd-backup-restore --key region`
   echo "Successfully fetched aws credentials from secret server."
 
   write_aws_secret "${ACCESS_KEY_ID}" "${SECRET_ACCESS_KEY}" "${REGION}"
@@ -297,11 +307,12 @@ function run_test_on_cluster() {
     setup-aws-infrastructure
   fi
 
-  export ETCD_VERSION=${ETCD_VERSION:-"v3.4.13-bootstrap-1"}
-  echo "Etcd version: ${ETCD_VERSION}"
+  # TODO: change the etcd wrapper version to a newer version which spawns etcd v3.4.34
+  export ETCD_WRAPPER_VERSION=${ETCD_WRAPPER_VERSION:-"v0.2.0"}
+  echo "etcd-wrapper version: ${ETCD_WRAPPER_VERSION}"
 
   export ETCDBR_VERSION=${ETCDBR_VERSION:-${ETCDBR_VER:-"v0.12.1"}}
-  echo "Etcd-backup-restore version: ${ETCDBR_VERSION}"
+  echo "etcd-backup-restore version: ${ETCDBR_VERSION}"
 
   echo "Starting integration tests on k8s cluster."
 

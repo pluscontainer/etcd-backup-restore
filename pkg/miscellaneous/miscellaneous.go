@@ -1,24 +1,17 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package miscellaneous
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	errored "errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -38,11 +31,11 @@ import (
 	"go.etcd.io/etcd/etcdserver/api/v3rpc/rpctypes"
 	"go.etcd.io/etcd/etcdserver/etcdserverpb"
 	"go.etcd.io/etcd/pkg/types"
-	"gopkg.in/yaml.v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/yaml"
 
 	appsv1 "k8s.io/api/apps/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -64,7 +57,15 @@ const (
 	ScaledToMultiNodeAnnotationKey = "gardener.cloud/scaled-to-multi-node"
 
 	https = "https"
+
+	// etcdWrapperPort defines the port no. used by etcd-wrapper.
+	etcdWrapperPort = "9095"
 )
+
+type advertiseURLsConfig struct {
+	AdvertiseClientURLs      map[string][]string `json:"advertise-client-urls"`
+	InitialAdvertisePeerURLs map[string][]string `json:"initial-advertise-peer-urls"`
+}
 
 type advertiseURLsConfig struct {
 	AdvertiseClientURLs      map[string][]string `json:"advertise-client-urls"`
@@ -92,7 +93,7 @@ func GetLatestFullSnapshotAndDeltaSnapList(store brtypes.SnapStore) (*brtypes.Sn
 		fullSnapshot  *brtypes.Snapshot
 		deltaSnapList brtypes.SnapList
 	)
-	snapList, err := store.List()
+	snapList, err := store.List(false)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -127,7 +128,7 @@ type backup struct {
 // GetFilteredBackups returns sorted by date (new -> old) SnapList. It will also filter the snapshots that should be included or not using the filter function.
 // If the filter is nil it will return all snapshots. Also, maxBackups can be used to target only the last N snapshots (-1 = all).
 func GetFilteredBackups(store brtypes.SnapStore, maxBackups int, filter func(snaps brtypes.Snapshot) bool) (brtypes.SnapList, error) {
-	snapList, err := store.List()
+	snapList, err := store.List(false)
 	if err != nil {
 		return nil, err
 	}
@@ -198,10 +199,10 @@ func StartEmbeddedEtcd(logger *logrus.Entry, ro *brtypes.RestoreOptions) (*embed
 	if err != nil {
 		return nil, err
 	}
-	cfg.LPUrls = []url.URL{*lpurl}
-	cfg.LCUrls = []url.URL{*lcurl}
-	cfg.APUrls = []url.URL{*apurl}
-	cfg.ACUrls = []url.URL{*acurl}
+	cfg.ListenPeerUrls = []url.URL{*lpurl}
+	cfg.ListenClientUrls = []url.URL{*lcurl}
+	cfg.AdvertisePeerUrls = []url.URL{*apurl}
+	cfg.AdvertiseClientUrls = []url.URL{*acurl}
 	cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 	cfg.QuotaBackendBytes = ro.Config.EmbeddedEtcdQuotaBytes
 	cfg.MaxRequestBytes = ro.Config.MaxRequestBytes
@@ -466,11 +467,11 @@ func GetInitialClusterStateIfScaleup(ctx context.Context, logger logrus.Entry, c
 	}
 
 	if IsAnnotationPresent(etcdSts, ScaledToMultiNodeAnnotationKey) {
-		return pointer.StringPtr(ClusterStateExisting), nil
+		return ptr.To(ClusterStateExisting), nil
 	}
 
 	if *etcdSts.Spec.Replicas > 1 && *etcdSts.Spec.Replicas > etcdSts.Status.UpdatedReplicas {
-		return pointer.StringPtr(ClusterStateExisting), nil
+		return ptr.To(ClusterStateExisting), nil
 	}
 	return nil, nil
 }
@@ -559,42 +560,88 @@ func ReadConfigFileAsMap(path string) (map[string]interface{}, error) {
 	return c, nil
 }
 
-// ParsePeerURL forms a PeerURL, given podName by parsing the initial-advertise-peer-urls
-func ParsePeerURL(initialAdvertisePeerURLs, podName string) (string, error) {
-	tokens := strings.Split(initialAdvertisePeerURLs, "@")
-	if len(tokens) < 4 {
-		return "", fmt.Errorf("invalid peer URL : %s", initialAdvertisePeerURLs)
+// parseAdvertiseURLsConfig reads and parses the config file and returns the advertise URLs config.
+func parseAdvertiseURLsConfig(configFile string) (*advertiseURLsConfig, error) {
+	var advURLsConfig advertiseURLsConfig
+	config, err := os.ReadFile(configFile)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read etcd config file at path: %s : %w", configFile, err)
 	}
-	domaiName := fmt.Sprintf("%s.%s.%s", tokens[1], tokens[2], "svc")
-	return fmt.Sprintf("%s://%s.%s:%s", tokens[0], podName, domaiName, tokens[3]), nil
+
+	if err := yaml.Unmarshal(config, &advURLsConfig); err != nil {
+		return nil, fmt.Errorf("unable to unmarshal etcd config yaml file at path: %s : %w", configFile, err)
+	}
+	return &advURLsConfig, nil
 }
 
-// IsPeerURLTLSEnabled checks whether the peer address is TLS enabled or not.
+// GetMemberPeerURLs retrieves the initial advertise peer URLs for the etcd member using the POD_NAME environment variable.
+func GetMemberPeerURLs(configFile string) ([]string, error) {
+	memberName, err := GetEnvVarOrError("POD_NAME")
+	if err != nil {
+		return nil, err
+	}
+
+	advURLsConfig, err := parseAdvertiseURLsConfig(configFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse advertise URLs config: %w", err)
+	}
+
+	peerURLs, ok := advURLsConfig.InitialAdvertisePeerURLs[memberName]
+	if !ok || len(peerURLs) == 0 {
+		return nil, fmt.Errorf("no peer URLs found for pod %s", memberName)
+	}
+
+	for _, peerURL := range peerURLs {
+		if _, err := url.Parse(peerURL); err != nil {
+			return nil, fmt.Errorf("invalid peer URL %s: %w", peerURL, err)
+		}
+	}
+	return peerURLs, nil
+}
+
+// GetMemberClientURLs retrieves the advertise client URLs for the etcd member using the POD_NAME environment variable.
+func GetMemberClientURLs(configFile string) ([]string, error) {
+	memberName, err := GetEnvVarOrError("POD_NAME")
+	if err != nil {
+		return nil, err
+	}
+
+	advURLsConfig, err := parseAdvertiseURLsConfig(configFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse advertise URLs config: %w", err)
+	}
+
+	clientURLs, ok := advURLsConfig.AdvertiseClientURLs[memberName]
+	if !ok || len(clientURLs) == 0 {
+		return nil, fmt.Errorf("no client URLs found for pod %s", memberName)
+	}
+
+	for _, clientURL := range clientURLs {
+		if _, err := url.Parse(clientURL); err != nil {
+			return nil, fmt.Errorf("invalid client URL %s: %w", clientURL, err)
+		}
+	}
+	return clientURLs, nil
+}
+
+// IsPeerURLTLSEnabled checks whether all peer URLs are TLS-enabled (i.e., use the "https" scheme).
 func IsPeerURLTLSEnabled() (bool, error) {
-	podName, err := GetEnvVarOrError("POD_NAME")
+	memberPeerURLs, err := GetMemberPeerURLs(GetConfigFilePath())
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to get initial advertise peer URLs: %w", err)
 	}
 
-	configFile := GetConfigFilePath()
-
-	config, err := ReadConfigFileAsMap(configFile)
-	if err != nil {
-		return false, err
-	}
-	initAdPeerURL := config["initial-advertise-peer-urls"]
-
-	memberPeerURL, err := ParsePeerURL(initAdPeerURL.(string), podName)
-	if err != nil {
-		return false, err
+	for _, peerURL := range memberPeerURLs {
+		parsedPeerURL, err := url.Parse(peerURL)
+		if err != nil {
+			return false, fmt.Errorf("failed to parse peer URL %s: %w", peerURL, err)
+		}
+		if parsedPeerURL.Scheme != https {
+			return false, nil
+		}
 	}
 
-	peerURL, err := url.Parse(memberPeerURL)
-	if err != nil {
-		return false, err
-	}
-
-	return peerURL.Scheme == https, nil
+	return true, nil
 }
 
 // GetPrevScheduledSnapTime returns the previous schedule snapshot time.
@@ -633,4 +680,56 @@ func RemoveDir(dir string) error {
 		return err
 	}
 	return nil
+}
+
+// RestartEtcdWrapper is to call the "/stop" endpoint of etcd-wrapper to restart the etcd-wrapper container.
+func RestartEtcdWrapper(ctx context.Context, tlsEnabled bool, etcdConnectionConfig *brtypes.EtcdConnectionConfig) error {
+	client := &http.Client{}
+
+	etcdWrapperURL, err := getEtcdWrapperEndpoint(etcdConnectionConfig.Endpoints)
+	if err != nil {
+		return err
+	}
+
+	if tlsEnabled {
+		caCertPool := x509.NewCertPool()
+		caCert, err := os.ReadFile(etcdConnectionConfig.CaFile)
+		if err != nil {
+			return err
+		}
+		caCertPool.AppendCertsFromPEM(caCert)
+		client.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs: caCertPool,
+			},
+		}
+	}
+
+	httpCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(httpCtx, http.MethodPost, fmt.Sprintf("%s/%s", etcdWrapperURL, "stop"), nil)
+	if err != nil {
+		return err
+	}
+	response, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	return nil
+}
+
+func getEtcdWrapperEndpoint(etcdEndpoints []string) (string, error) {
+	if len(etcdEndpoints) == 0 {
+		return "", fmt.Errorf("etcd endpoints are not passed correctly")
+	}
+
+	etcdURL, err := url.Parse(etcdEndpoints[0])
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%s://%s:%s", etcdURL.Scheme, etcdURL.Hostname(), etcdWrapperPort), nil
 }

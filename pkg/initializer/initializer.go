@@ -1,16 +1,6 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package initializer
 
@@ -89,6 +79,13 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 	// Note: first member of etcd cluster can never be part of scale-up case.
 	// TODO: consider removing this special check for first cluster member when backup-restore can check presence of any member in cluster.
 	if miscellaneous.IsMultiNode(logger) && !strings.HasSuffix(podName, "0") {
+		clientSet, err := miscellaneous.GetKubernetesClientSetOrError()
+		if err != nil {
+			logger.Fatalf("failed to create clientset, %v", err)
+		}
+
+		m := member.NewMemberControl(e.Config.EtcdConnectionConfig)
+
 		// check heartbeat of etcd member
 		if memberHeartbeatPresent = m.WasMemberInCluster(ctx, clientSet); memberHeartbeatPresent {
 			logger.Info("member found to be already a part of the cluster")

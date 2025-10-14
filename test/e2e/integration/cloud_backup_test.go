@@ -1,16 +1,6 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package integration_test
 
@@ -128,6 +118,11 @@ var _ = Describe("CloudBackup", func() {
 			Container: os.Getenv("TEST_ID"),
 			Prefix:    path.Join("v2"),
 		}
+		// Required as the config file for embedded ETCD fetches ETCD instance name from the POD_NAME variable
+		podName := "etcd1"
+		podNamespace := "etcd-test"
+		Expect(os.Setenv("POD_NAME", podName)).To(Succeed())
+		Expect(os.Setenv("POD_NAMESPACE", podNamespace)).To(Succeed())
 		// Create and place a ETCD config yaml
 		outfile := "/tmp/etcd.conf.yaml"
 		etcdConfigYaml := `# Human-readable name for this member.
@@ -138,8 +133,12 @@ snapshot-count: 75000
 enable-v2: false
 quota-backend-bytes: 1073741824
 listen-client-urls: http://0.0.0.0:2379
-advertise-client-urls: http://0.0.0.0:2379
-initial-advertise-peer-urls: http@etcd-main-peer@default@2380
+advertise-client-urls:
+  ` + podName + `:
+    - http://0.0.0.0:2379
+initial-advertise-peer-urls:
+  ` + podName + `:
+    - http://etcd-main-peer.default:2380
 initial-cluster: etcd1=http://0.0.0.0:2380
 initial-cluster-token: new
 initial-cluster-state: new
@@ -149,9 +148,6 @@ auto-compaction-retention: 30m`
 		err := os.WriteFile(outfile, []byte(etcdConfigYaml), 0755)
 		Expect(err).ShouldNot(HaveOccurred())
 		Expect(os.Setenv("ETCD_CONF", outfile)).To(Succeed())
-		// Required as the config file for embedded ETCD fetches ETCD instance name from the POD_NAME variable
-		Expect(os.Setenv("POD_NAME", "etcd1")).To(Succeed())
-		Expect(os.Setenv("POD_NAMESPACE", "etcd-test")).To(Succeed())
 	})
 
 	Describe("Regular backups", func() {
@@ -165,7 +161,7 @@ auto-compaction-retention: 30m`
 			store, err = snapstore.GetSnapstore(snapstoreConfig)
 			Expect(err).ShouldNot(HaveOccurred())
 
-			snapList, err := store.List()
+			snapList, err := store.List(false)
 			Expect(err).ShouldNot(HaveOccurred())
 			for _, snap := range snapList {
 				Expect(store.Delete(*snap)).To(Succeed())
@@ -186,13 +182,13 @@ auto-compaction-retention: 30m`
 
 		Context("taken at 1 minute interval", func() {
 			It("should take periodic backups.", func() {
-				snaplist, err := store.List()
+				snaplist, err := store.List(false)
 				Expect(snaplist).Should(BeEmpty())
 				Expect(err).ShouldNot(HaveOccurred())
 
 				time.Sleep(70 * time.Second)
 
-				snaplist, err = store.List()
+				snaplist, err = store.List(false)
 				Expect(snaplist).ShouldNot(BeEmpty())
 				Expect(err).ShouldNot(HaveOccurred())
 			})
@@ -200,13 +196,13 @@ auto-compaction-retention: 30m`
 
 		Context("taken at 1 minute interval", func() {
 			It("should take periodic backups and limit based garbage collect backups over maxBackups configured", func() {
-				snaplist, err := store.List()
+				snaplist, err := store.List(false)
 				Expect(snaplist).Should(BeEmpty())
 				Expect(err).ShouldNot(HaveOccurred())
 
 				time.Sleep(190 * time.Second)
 
-				snaplist, err = store.List()
+				snaplist, err = store.List(false)
 				Expect(err).ShouldNot(HaveOccurred())
 				count := 0
 				for _, snap := range snaplist {

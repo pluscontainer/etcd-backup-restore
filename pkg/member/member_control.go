@@ -1,16 +1,6 @@
-// Copyright (c) 2023 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package member
 
@@ -89,6 +79,9 @@ type Control interface {
 
 	// IsLearnerPresent checks for the learner(non-voting) member in a cluster.
 	IsLearnerPresent(context.Context) (bool, error)
+
+	// GetPeerURLs returns the list of current peer URLs of the etcd cluster member.
+	GetPeerURLs(context.Context, etcdClient.ClusterCloser) ([]string, error)
 }
 
 // memberControl holds the configuration for the mechanism of adding a new member to the cluster.
@@ -133,7 +126,7 @@ func NewMemberControl(etcdConnConfig *brtypes.EtcdConnectionConfig) Control {
 // AddMemberAsLearner add a member as a learner to the etcd cluster
 func (m *memberControl) AddMemberAsLearner(ctx context.Context) error {
 	//Add member as learner to cluster
-	memberURL, err := getMemberPeerURL(m.configFile, m.podName)
+	memberPeerURLs, err := miscellaneous.GetMemberPeerURLs(m.configFile)
 	if err != nil {
 		m.logger.Fatalf("Error fetching etcd member URL : %v", err)
 	}
@@ -147,10 +140,10 @@ func (m *memberControl) AddMemberAsLearner(ctx context.Context) error {
 	memAddCtx, cancel := context.WithTimeout(ctx, EtcdTimeout)
 	defer cancel()
 	start := time.Now()
-	response, err := cli.MemberAddAsLearner(memAddCtx, []string{memberURL})
+	response, err := cli.MemberAddAsLearner(memAddCtx, memberPeerURLs)
 	if err != nil {
 		if errors.Is(err, rpctypes.Error(rpctypes.ErrGRPCPeerURLExist)) || errors.Is(err, rpctypes.Error(rpctypes.ErrGRPCMemberExist)) {
-			m.logger.Infof("Member %s already part of etcd cluster", memberURL)
+			m.logger.Infof("Member %s with peer urls %v already part of etcd cluster", m.podName, memberPeerURLs)
 			return nil
 		} else if errors.Is(err, rpctypes.Error(rpctypes.ErrGRPCTooManyLearners)) {
 			m.logger.Infof("Unable to add member %s as a learner because the cluster already has a learner", m.podName)
@@ -218,28 +211,11 @@ func (m *memberControl) IsMemberInCluster(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func getMemberPeerURL(configFile string, podName string) (string, error) {
-	config, err := miscellaneous.ReadConfigFileAsMap(configFile)
-	if err != nil {
-		return "", err
-	}
-	initAdPeerURL := config["initial-advertise-peer-urls"]
-	if initAdPeerURL == nil {
-		return "", errors.New("initial-advertise-peer-urls must be set in etcd config")
-	}
-	peerURL, err := miscellaneous.ParsePeerURL(initAdPeerURL.(string), podName)
-	if err != nil {
-		return "", fmt.Errorf("could not parse peer URL from the config file : %v", err)
-	}
-	return peerURL, nil
-}
-
 // doUpdateMemberPeerAddress updated the peer address of a specified etcd member
 func (m *memberControl) doUpdateMemberPeerAddress(ctx context.Context, cli etcdClient.ClusterCloser, id uint64) error {
 	// Already existing clusters or cluster after restoration have `http://localhost:2380` as the peer address. This needs to explicitly updated to the correct peer address.
 	m.logger.Infof("Updating member peer URL for %s", m.podName)
-
-	memberPeerURL, err := getMemberPeerURL(m.configFile, m.podName)
+	memberPeerURLs, err := miscellaneous.GetMemberPeerURLs(m.configFile)
 	if err != nil {
 		return fmt.Errorf("could not fetch member URL : %v", err)
 	}
@@ -247,7 +223,7 @@ func (m *memberControl) doUpdateMemberPeerAddress(ctx context.Context, cli etcdC
 	memberUpdateCtx, cancel := context.WithTimeout(ctx, EtcdTimeout)
 	defer cancel()
 
-	if _, err = cli.MemberUpdate(memberUpdateCtx, id, []string{memberPeerURL}); err == nil {
+	if _, err = cli.MemberUpdate(memberUpdateCtx, id, memberPeerURLs); err == nil {
 		m.logger.Info("Successfully updated the member peer URL")
 		return nil
 	}
@@ -403,6 +379,33 @@ func (m *memberControl) GetReadyReplicas(ctx context.Context, clientSet client.C
 	}
 
 	return int(etcdsts.Status.ReadyReplicas), nil
+}
+
+// GetPeerURLs returns the list of current peer URLs of the etcd cluster member.
+func (m *memberControl) GetPeerURLs(ctx context.Context, closer etcdClient.ClusterCloser) ([]string, error) {
+	var (
+		etcdMemberList *clientv3.MemberListResponse
+		err            error
+	)
+	backoff := miscellaneous.CreateBackoff(RetryPeriod, RetrySteps)
+
+	// List all members in etcd cluster
+	if err = retry.OnError(backoff, func(err error) bool {
+		return err != nil
+	}, func() error {
+		memListCtx, cancel := context.WithTimeout(ctx, EtcdTimeout)
+		defer cancel()
+		etcdMemberList, err = closer.MemberList(memListCtx)
+		return err
+	}); err != nil {
+		return nil, fmt.Errorf("could not list any etcd members %w", err)
+	}
+	for _, member := range etcdMemberList.Members {
+		if member.GetName() == m.podName {
+			return member.GetPeerURLs(), nil
+		}
+	}
+	return []string{}, nil
 }
 
 // WasMemberInCluster checks the whether etcd member was part of etcd cluster.

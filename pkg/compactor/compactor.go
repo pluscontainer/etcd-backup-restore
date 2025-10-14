@@ -1,16 +1,6 @@
-// Copyright (c) 2023 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package compactor
 
@@ -77,19 +67,6 @@ func (cp *Compactor) Compact(ctx context.Context, opts *brtypes.CompactOptions) 
 		return nil, fmt.Errorf("no base snapshot found. Nothing is available for compaction")
 	}
 
-	cp.logger.Infof("Creating temporary etcd directory %s for restoration.", compactorRestoreOptions.Config.DataDir)
-	err := os.MkdirAll(compactorRestoreOptions.Config.DataDir, 0700)
-	if err != nil {
-		cp.logger.Errorf("Unable to create temporary etcd directory for compaction: %s", err.Error())
-		return nil, err
-	}
-
-	defer func() {
-		if err := os.RemoveAll(compactorRestoreOptions.Config.DataDir); err != nil {
-			cp.logger.Errorf("Failed to remove temporary etcd directory %s: %v", compactorRestoreOptions.Config.DataDir, err)
-		}
-	}()
-
 	// Then restore from the snapshots
 	r, err := restorer.NewRestorer(cp.store, cp.logger)
 	if err != nil {
@@ -99,6 +76,12 @@ func (cp *Compactor) Compact(ctx context.Context, opts *brtypes.CompactOptions) 
 	if err != nil {
 		return nil, fmt.Errorf("unable to restore snapshots during compaction: %v", err)
 	}
+
+	defer func() {
+		if err := os.RemoveAll(compactorRestoreOptions.Config.DataDir); err != nil {
+			cp.logger.Errorf("Failed to remove temporary etcd directory %s: %v", compactorRestoreOptions.Config.DataDir, err)
+		}
+	}()
 
 	cp.logger.Info("Restoration for compaction is done.")
 	// There is a possibility that restore operation may not start an embedded ETCD.
@@ -192,7 +175,7 @@ func (cp *Compactor) Compact(ctx context.Context, opts *brtypes.CompactOptions) 
 	if opts.EnabledLeaseRenewal {
 		// Update revisions in holder identity of full snapshot lease.
 		ctx, cancel := context.WithTimeout(ctx, brtypes.LeaseUpdateTimeoutDuration)
-		if err := heartbeat.FullSnapshotCaseLeaseUpdate(ctx, cp.logger, snapshot, cp.k8sClientset, opts.FullSnapshotLeaseName, opts.DeltaSnapshotLeaseName); err != nil {
+		if err := heartbeat.FullSnapshotCaseLeaseUpdate(ctx, cp.logger, snapshot, cp.k8sClientset, opts.FullSnapshotLeaseName, snapshot.CreatedOn); err != nil {
 			cp.logger.Warnf("Snapshot lease update failed : %v", err)
 		}
 		cancel()

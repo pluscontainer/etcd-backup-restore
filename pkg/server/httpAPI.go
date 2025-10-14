@@ -1,16 +1,6 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License
+// SPDX-License-Identifier: Apache-2.0
 
 package server
 
@@ -39,12 +29,12 @@ import (
 	"github.com/gardener/etcd-backup-restore/pkg/snapshot/snapshotter"
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
-	"github.com/ghodss/yaml"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/clientv3"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -431,25 +421,23 @@ func (h *HTTPHandler) serveConfig(rw http.ResponseWriter, req *http.Request) {
 
 	config["name"] = podName
 
-	initAdPeerURL := config["initial-advertise-peer-urls"]
-	protocol, svcName, namespace, peerPort, err := parsePeerURL(fmt.Sprint(initAdPeerURL))
+	// fetch initial-advertise-peer-urls from etcd config file
+	initAdPeerURLs, err := miscellaneous.GetMemberPeerURLs(inputFileName)
 	if err != nil {
-		h.Logger.Warnf("Unable to determine service name, namespace, peer port from advertise peer urls : %v", err)
+		h.Logger.Warnf("Unable to get initial-advertise-peer-urls from etcd config file: %v", err)
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	domaiName := fmt.Sprintf("%s.%s.%s", svcName, namespace, "svc")
-	config["initial-advertise-peer-urls"] = fmt.Sprintf("%s://%s.%s:%s", protocol, podName, domaiName, peerPort)
+	config["initial-advertise-peer-urls"] = strings.Join(initAdPeerURLs, ",")
 
-	advClientURL := config["advertise-client-urls"]
-	protocol, svcName, namespace, clientPort, err := parseAdvClientURL(fmt.Sprint(advClientURL))
+	// fetch advertise-client-urls from etcd config file
+	advClientURLs, err := miscellaneous.GetMemberClientURLs(inputFileName)
 	if err != nil {
-		h.Logger.Warnf("Unable to determine service name, namespace, peer port from advertise client url : %v", err)
+		h.Logger.Warnf("Unable to get advertise-client-urls from etcd config file: %v", err)
 		rw.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	domaiName = fmt.Sprintf("%s.%s.%s", svcName, namespace, "svc")
-	config["advertise-client-urls"] = fmt.Sprintf("%s://%s.%s:%s", protocol, podName, domaiName, clientPort)
+	config["advertise-client-urls"] = strings.Join(advClientURLs, ",")
 
 	config["initial-cluster"] = getInitialCluster(req.Context(), fmt.Sprint(config["initial-cluster"]), *h.EtcdConnectionConfig, *h.Logger, podName)
 
@@ -569,22 +557,6 @@ func getInitialCluster(ctx context.Context, initialCluster string, etcdConn brty
 	}
 
 	return initialCluster
-}
-
-func parsePeerURL(peerURL string) (string, string, string, string, error) {
-	tokens := strings.Split(peerURL, "@")
-	if len(tokens) < 4 {
-		return "", "", "", "", fmt.Errorf("total length of tokens is less than four")
-	}
-	return tokens[0], tokens[1], tokens[2], tokens[3], nil
-}
-
-func parseAdvClientURL(advClientURL string) (string, string, string, string, error) {
-	tokens := strings.Split(advClientURL, "@")
-	if len(tokens) < 4 {
-		return "", "", "", "", fmt.Errorf("total length of tokens is less than four")
-	}
-	return tokens[0], tokens[1], tokens[2], tokens[3], nil
 }
 
 // delegateReqToLeader forwards the incoming http/https request to BackupLeader.

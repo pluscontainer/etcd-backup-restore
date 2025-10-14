@@ -1,16 +1,6 @@
-// Copyright (c) 2021 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package miscellaneous
 
@@ -26,7 +16,8 @@ import (
 	mockfactory "github.com/gardener/etcd-backup-restore/pkg/mock/etcdutil/client"
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
-	"github.com/golang/mock/gomock"
+	"go.uber.org/mock/gomock"
+	"sigs.k8s.io/yaml"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -36,7 +27,7 @@ import (
 	"go.etcd.io/etcd/etcdserver/etcdserverpb"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 var (
@@ -476,7 +467,7 @@ var _ = Describe("Miscellaneous Tests", func() {
 		Context("In single node etcd: no scale-up", func() {
 			BeforeEach(func() {
 				sts.Spec = appsv1.StatefulSetSpec{
-					Replicas: pointer.Int32Ptr(1),
+					Replicas: ptr.To(int32(1)),
 				}
 				sts.Status = appsv1.StatefulSetStatus{
 					UpdatedReplicas: 1,
@@ -498,7 +489,7 @@ var _ = Describe("Miscellaneous Tests", func() {
 		Context("In multi-node etcd bootstrap: no scale-up", func() {
 			BeforeEach(func() {
 				sts.Spec = appsv1.StatefulSetSpec{
-					Replicas: pointer.Int32Ptr(3),
+					Replicas: ptr.To(int32(3)),
 				}
 				sts.Status = appsv1.StatefulSetStatus{
 					UpdatedReplicas: 3,
@@ -520,7 +511,7 @@ var _ = Describe("Miscellaneous Tests", func() {
 		Context("In case of Scaling up from single node to multi-node etcd with no scale-up annotation set", func() {
 			BeforeEach(func() {
 				sts.Spec = appsv1.StatefulSetSpec{
-					Replicas: pointer.Int32Ptr(3),
+					Replicas: ptr.To(int32(3)),
 				}
 				sts.Status = appsv1.StatefulSetStatus{
 					UpdatedReplicas: 1,
@@ -542,7 +533,7 @@ var _ = Describe("Miscellaneous Tests", func() {
 		Context("scaling of single node to multi-node etcd with scale-up annotation set", func() {
 			BeforeEach(func() {
 				sts.Spec = appsv1.StatefulSetSpec{
-					Replicas: pointer.Int32Ptr(3),
+					Replicas: ptr.To(int32(3)),
 				}
 				sts.Status = appsv1.StatefulSetStatus{
 					UpdatedReplicas: 3,
@@ -577,7 +568,7 @@ var _ = Describe("Miscellaneous Tests", func() {
 						Namespace: namespace,
 					},
 					Spec: appsv1.StatefulSetSpec{
-						Replicas: pointer.Int32Ptr(3),
+						Replicas: ptr.To(int32(3)),
 					},
 					Status: appsv1.StatefulSetStatus{
 						UpdatedReplicas: 1,
@@ -596,28 +587,155 @@ var _ = Describe("Miscellaneous Tests", func() {
 		})
 	})
 
-	Describe("parse peer urls config", func() {
-		var (
-			initialAdPeerURL string
-			podName          string
+	Describe("Get Advertise URLs", func() {
+		const (
+			configFile = "/tmp/etcd-config.yaml"
+			podName    = "test-pod"
 		)
-
-		BeforeEach(func() {
-			podName = "etcd-test-pod-0"
+		Context("When POD_NAME environment variable is not set", func() {
+			DescribeTable("should return an error",
+				func(field string, function func(string) ([]string, error)) {
+					_, err := function(configFile)
+					Expect(err).To(HaveOccurred())
+				},
+				Entry("GetMemberPeerURLs", "initial-advertise-peer-urls", GetMemberPeerURLs),
+				Entry("GetMemberClientURLs", "advertise-client-urls", GetMemberClientURLs),
+			)
 		})
 
-		Context("parse peer url", func() {
-			It("parsing well-defined initial-advertise-peer-urls", func() {
-				initialAdPeerURL = "https@etcd-events-peer@shoot--dev--test@2380"
-				peerURL, err := ParsePeerURL(initialAdPeerURL, podName)
-				Expect(err).To(BeNil())
-				Expect(peerURL).To(Equal("https://etcd-test-pod-0.etcd-events-peer.shoot--dev--test.svc:2380"))
+		Context("When POD_NAME environment variable is set", func() {
+			var config map[string]interface{}
+			var podUrlsMap map[string][]string
+
+			BeforeEach(func() {
+				Expect(os.Setenv("POD_NAME", podName)).To(Succeed())
+				Expect(os.Setenv("ETCD_CONF", configFile)).To(Succeed())
 			})
 
-			It("parsing malformed initial-advertise-peer-urls", func() {
-				initialAdPeerURL = "https@etcd-events-peer@shoot--dev--test"
-				_, err := ParsePeerURL(initialAdPeerURL, podName)
-				Expect(err).ToNot(BeNil())
+			Context("When the config file cannot be read", func() {
+				DescribeTable("should return an error",
+					func(field string, function func(string) ([]string, error)) {
+						_, err := function(configFile)
+						Expect(err).To(HaveOccurred())
+					},
+					Entry("GetMemberPeerURLs", "initial-advertise-peer-urls", GetMemberPeerURLs),
+					Entry("GetMemberClientURLs", "advertise-client-urls", GetMemberClientURLs),
+				)
+			})
+
+			Context("When advertise-urls is not set in the config file", func() {
+				BeforeEach(func() {
+					config = map[string]interface{}{
+						"name": "etcd-test",
+					}
+				})
+
+				AfterEach(func() {
+					Expect(os.Remove(configFile)).To(Succeed())
+				})
+
+				DescribeTable("should return an error",
+					func(field string, function func(string) ([]string, error)) {
+						writeConfigToFile(configFile, config)
+
+						_, err := function(configFile)
+						Expect(err).To(HaveOccurred())
+					},
+					Entry("GetMemberPeerURLs", "initial-advertise-peer-urls", GetMemberPeerURLs),
+					Entry("GetMemberClientURLs", "advertise-client-urls", GetMemberClientURLs),
+				)
+			})
+
+			Context("When advertise-urls is set in the config file", func() {
+
+				BeforeEach(func() {
+					config = map[string]interface{}{
+						"name": "etcd-test",
+					}
+					podUrlsMap = make(map[string][]string)
+				})
+
+				AfterEach(func() {
+					Expect(os.Remove(configFile)).To(Succeed())
+				})
+
+				Context("When the advertise urls is not in the expected format", func() {
+
+					DescribeTable("should return an error",
+						func(field string, function func(string) ([]string, error)) {
+							config[field] = "invalid-format"
+							writeConfigToFile(configFile, config)
+
+							_, err := function(configFile)
+							Expect(err).To(HaveOccurred())
+						},
+						Entry("GetMemberPeerURLs", "initial-advertise-peer-urls", GetMemberPeerURLs),
+						Entry("GetMemberClientURLs", "advertise-client-urls", GetMemberClientURLs),
+					)
+				})
+
+				Context("When the pod name is not present in the config file", func() {
+					BeforeEach(func() {
+						podUrlsMap = map[string][]string{
+							"other-pod": {"http://pod1:2380", "http://pod1:2381"},
+						}
+					})
+
+					DescribeTable("should return an error",
+						func(field string, function func(string) ([]string, error)) {
+							config[field] = podUrlsMap
+							writeConfigToFile(configFile, config)
+
+							_, err := function(configFile)
+							Expect(err).To(HaveOccurred())
+						},
+						Entry("GetMemberPeerURLs", "initial-advertise-peer-urls", GetMemberPeerURLs),
+						Entry("GetMemberClientURLs", "advertise-client-urls", GetMemberClientURLs),
+					)
+				})
+
+				Context("When the pod name is present in the config file", func() {
+					Context("When an url is not in valid format", func() {
+						BeforeEach(func() {
+							podUrlsMap = map[string][]string{
+								podName: {"http://pod:2380", "ht@tp://invalid-url"},
+							}
+						})
+
+						DescribeTable("should return an error",
+							func(field string, function func(string) ([]string, error)) {
+								config[field] = podUrlsMap
+								writeConfigToFile(configFile, config)
+
+								_, err := function(configFile)
+								Expect(err).To(HaveOccurred())
+							},
+							Entry("GetMemberPeerURLs", "initial-advertise-peer-urls", GetMemberPeerURLs),
+							Entry("GetMemberClientURLs", "advertise-client-urls", GetMemberClientURLs),
+						)
+					})
+
+					Context("When the urls are in valid format", func() {
+						BeforeEach(func() {
+							podUrlsMap = map[string][]string{
+								podName: {"http://pod:2380", "http://pod:2381"},
+							}
+						})
+
+						DescribeTable("should return the peer URLs",
+							func(field string, function func(string) ([]string, error)) {
+								config[field] = podUrlsMap
+								writeConfigToFile(configFile, config)
+
+								urls, err := function(configFile)
+								Expect(err).To(Not(HaveOccurred()))
+								Expect(urls).To(Equal(podUrlsMap[podName]))
+							},
+							Entry("GetMemberPeerURLs", "initial-advertise-peer-urls", GetMemberPeerURLs),
+							Entry("GetMemberClientURLs", "advertise-client-urls", GetMemberClientURLs),
+						)
+					})
+				})
 			})
 		})
 	})
@@ -713,7 +831,7 @@ var _ = Describe("Miscellaneous Tests", func() {
 			outfile = "/tmp/etcd.conf.yaml"
 		)
 		BeforeEach(func() {
-			Expect(os.Setenv("POD_NAME", "test_pod")).To(Succeed())
+			Expect(os.Setenv("POD_NAME", "test_pod1")).To(Succeed())
 			Expect(os.Setenv("ETCD_CONF", outfile)).To(Succeed())
 		})
 		AfterEach(func() {
@@ -724,7 +842,16 @@ var _ = Describe("Miscellaneous Tests", func() {
 		Context("with non-TLS enabled peer url", func() {
 			BeforeEach(func() {
 				etcdConfigYaml := `name: etcd1
-initial-advertise-peer-urls: http@etcd-main-peer@default@2380
+initial-advertise-peer-urls:
+  test_pod1:
+  - http://etcd-main-peer.default:2380
+  - http://etcd-main-peer.default:2381
+  test_pod2:
+  - http://etcd-main-peer.default:2380
+  - http://etcd-main-peer.default:2381
+  test_pod3:
+  - http://etcd-main-peer.default:2380
+  - http://etcd-main-peer.default:2381
 initial-cluster: etcd1=http://0.0.0.0:2380`
 				err := os.WriteFile(outfile, []byte(etcdConfigYaml), 0755)
 				Expect(err).ShouldNot(HaveOccurred())
@@ -740,7 +867,16 @@ initial-cluster: etcd1=http://0.0.0.0:2380`
 		Context("with TLS enabled peer url", func() {
 			BeforeEach(func() {
 				etcdConfigYaml := `name: etcd1
-initial-advertise-peer-urls: https@etcd-main-peer@default@2380
+initial-advertise-peer-urls:
+  test_pod1:
+  - https://etcd-main-peer.default:2380
+  - https://etcd-main-peer.default:2381
+  test_pod2:
+  - https://etcd-main-peer.default:2380
+  - https://etcd-main-peer.default:2381
+  test_pod3:
+  - https://etcd-main-peer.default:2380
+  - https://etcd-main-peer.default:2381
 initial-cluster: etcd1=https://0.0.0.0:2380`
 				err := os.WriteFile(outfile, []byte(etcdConfigYaml), 0755)
 				Expect(err).ShouldNot(HaveOccurred())
@@ -749,6 +885,30 @@ initial-cluster: etcd1=https://0.0.0.0:2380`
 				enabled, err := IsPeerURLTLSEnabled()
 				Expect(err).To(BeNil())
 				Expect(enabled).To(BeTrue())
+			})
+		})
+
+		Context("with both TLS and non-TLS enabled peer url for the same pod", func() {
+			BeforeEach(func() {
+				etcdConfigYaml := `name: etcd1
+initial-advertise-peer-urls:
+  test_pod1:
+  - https://etcd-main-peer.default:2380
+  - http://etcd-main-peer.default:2381
+  test_pod2:
+  - https://etcd-main-peer.default:2380
+  - https://etcd-main-peer.default:2381
+  test_pod3:
+  - https://etcd-main-peer.default:2380
+  - https://etcd-main-peer.default:2381
+initial-cluster: etcd1=https://0.0.0.0:2380`
+				err := os.WriteFile(outfile, []byte(etcdConfigYaml), 0755)
+				Expect(err).ShouldNot(HaveOccurred())
+			})
+			It("should return false", func() {
+				enabled, err := IsPeerURLTLSEnabled()
+				Expect(err).To(BeNil())
+				Expect(enabled).To(BeFalse())
 			})
 		})
 
@@ -827,7 +987,7 @@ func NewDummyStore(snapList brtypes.SnapList) DummyStore {
 	return DummyStore{SnapList: snapList}
 }
 
-func (ds *DummyStore) List() (brtypes.SnapList, error) {
+func (ds *DummyStore) List(_ bool) (brtypes.SnapList, error) {
 	return ds.SnapList, nil
 }
 
@@ -841,4 +1001,12 @@ func (ds *DummyStore) Save(snap brtypes.Snapshot, rc io.ReadCloser) error {
 
 func (ds *DummyStore) Fetch(snap brtypes.Snapshot) (io.ReadCloser, error) {
 	return nil, nil
+}
+
+func writeConfigToFile(configFile string, config map[string]interface{}) {
+	byteSlice, err := yaml.Marshal(config)
+	Expect(err).NotTo(HaveOccurred())
+
+	err = os.WriteFile(configFile, byteSlice, 0644)
+	Expect(err).NotTo(HaveOccurred())
 }

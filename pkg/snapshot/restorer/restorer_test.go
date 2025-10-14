@@ -1,16 +1,6 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package restorer_test
 
@@ -31,10 +21,10 @@ import (
 	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 	"github.com/gardener/etcd-backup-restore/test/utils"
-	"github.com/golang/mock/gomock"
 	"github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/pkg/types"
+	"go.uber.org/mock/gomock"
 
 	. "github.com/gardener/etcd-backup-restore/pkg/snapshot/restorer"
 	. "github.com/onsi/ginkgo/v2"
@@ -467,7 +457,6 @@ var _ = Describe("Running Restorer", func() {
 		Context("when full snapshot is not compressed followed by multiple delta snapshots which are compressed using different compressionPolicy", func() {
 			It("Should able to restore", func() {
 				logger.Infoln("Starting restoration check when snapshots are available of different SnapshotSuffix")
-				memberPath := path.Join(etcdDir, "member")
 
 				// start the Snapshotter with compression not enabled to take full snapshot
 				compressionConfig := compressor.NewCompressorConfig()
@@ -522,8 +511,8 @@ var _ = Describe("Running Restorer", func() {
 				Expect(err).ShouldNot(HaveOccurred())
 				cancel()
 
-				// remove the member dir
-				err = os.RemoveAll(memberPath)
+				// remove the etcd data dir
+				err = os.RemoveAll(etcdDir)
 				Expect(err).ShouldNot(HaveOccurred())
 
 				baseSnapshot, deltaSnapList, err = miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
@@ -549,7 +538,6 @@ var _ = Describe("Running Restorer", func() {
 
 		Context("when full snapshot is compressed followed by multiple delta Snapshots which are uncompressed as well as compressed", func() {
 			It("Should able to restore", func() {
-				memberPath := path.Join(etcdDir, "member")
 
 				// populate the etcd with some data
 				resp := &utils.EtcdDataPopulationResponse{}
@@ -608,8 +596,8 @@ var _ = Describe("Running Restorer", func() {
 				Expect(err).ShouldNot(HaveOccurred())
 				cancel()
 
-				// remove the member dir
-				err = os.RemoveAll(memberPath)
+				// remove the etcd data dir
+				err = os.RemoveAll(etcdDir)
 				Expect(err).ShouldNot(HaveOccurred())
 
 				baseSnapshot, deltaSnapList, err = miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
@@ -933,8 +921,8 @@ var _ = Describe("Running Restorer when both v1 and v2 directory structures are 
 
 			//Restore
 
-			// remove the member dir
-			err = os.RemoveAll(path.Join(etcdDataDir, "member"))
+			// remove the etcd data dir
+			err = os.RemoveAll(etcdDataDir)
 			Expect(err).ShouldNot(HaveOccurred())
 
 			err = restorer.RestoreAndStopEtcd(restoreOpts, nil)
@@ -966,8 +954,8 @@ var _ = Describe("Running Restorer when both v1 and v2 directory structures are 
 
 			//Restore
 
-			// remove the member dir
-			err = os.RemoveAll(path.Join(etcdDataDir, "member"))
+			// remove the etcd data dir
+			err = os.RemoveAll(etcdDataDir)
 			Expect(err).ShouldNot(HaveOccurred())
 
 			err = restorer.RestoreAndStopEtcd(restoreOpts, nil)
@@ -999,8 +987,8 @@ var _ = Describe("Running Restorer when both v1 and v2 directory structures are 
 
 			//Restore
 
-			// remove the member dir
-			err = os.RemoveAll(path.Join(etcdDataDir, "member"))
+			// remove the etcd data dir
+			err = os.RemoveAll(etcdDataDir)
 			Expect(err).ShouldNot(HaveOccurred())
 
 			err = restorer.RestoreAndStopEtcd(restoreOpts, nil)
@@ -1034,8 +1022,8 @@ var _ = Describe("Running Restorer when both v1 and v2 directory structures are 
 
 			//Restore
 
-			// remove the member dir
-			err = os.RemoveAll(path.Join(etcdDataDir, "member"))
+			// remove the etcd data dir
+			err = os.RemoveAll(etcdDataDir)
 			Expect(err).ShouldNot(HaveOccurred())
 
 			err = restorer.RestoreAndStopEtcd(restoreOpts, nil)
@@ -1068,8 +1056,8 @@ var _ = Describe("Running Restorer when both v1 and v2 directory structures are 
 
 				//Restore
 
-				// remove the member dir
-				err = os.RemoveAll(path.Join(etcdDataDir, "member"))
+				// remove the etcd data dir
+				err = os.RemoveAll(etcdDataDir)
 				Expect(err).ShouldNot(HaveOccurred())
 
 				err = restorer.RestoreAndStopEtcd(restoreOpts, nil)

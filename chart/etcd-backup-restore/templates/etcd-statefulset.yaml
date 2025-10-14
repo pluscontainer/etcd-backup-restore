@@ -191,15 +191,24 @@ spec:
             secretKeyRef:
               name: {{ .Release.Name }}-etcd-backup
               key: "storageKey"
-{{- else if eq .Values.backup.storageProvider "GCS" }}
-        - name: "GOOGLE_APPLICATION_CREDENTIALS"
-          value: "/root/.gcp/serviceaccount.json"
-  {{- if .Values.backup.gcs.storageAPIEndpoint }}
-        - name: "GOOGLE_STORAGE_API_ENDPOINT"
+  {{- if .Values.backup.abs.emulatorEnabled }}
+        - name: "AZURE_EMULATOR_ENABLED"
           valueFrom:
             secretKeyRef:
               name: {{ .Release.Name }}-etcd-backup
-              key: "storageAPIEndpoint"
+              key: "emulatorEnabled"
+              optional: true
+  {{- end }}
+{{- else if eq .Values.backup.storageProvider "GCS" }}
+        - name: "GOOGLE_APPLICATION_CREDENTIALS"
+          value: "/root/.gcp/serviceaccount.json"
+  {{- if .Values.backup.gcs.emulatorEnabled }}
+        - name: "GOOGLE_EMULATOR_ENABLED"
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-etcd-backup
+              key: "emulatorEnabled"
+              optional: true
   {{- end }}
 {{- else if eq .Values.backup.storageProvider "Swift" }}
         - name: "OS_AUTH_URL"
@@ -270,6 +279,7 @@ spec:
             secretKeyRef:
               name: {{ .Release.Name }}-etcd-backup
               key: "disableSsl"
+              optional: true
   {{- end }}
   {{- if .Values.backup.ecs.insecureSkipVerify }}
         - name: "ECS_INSECURE_SKIP_VERIFY"
@@ -277,6 +287,7 @@ spec:
             secretKeyRef:
               name: {{ .Release.Name }}-etcd-backup
               key: "insecureSkipVerify"
+              optional: true
   {{- end }}
 {{- end }}
         volumeMounts:
@@ -303,7 +314,7 @@ spec:
       volumes:
       - name: etcd-config-file
         configMap:
-          name: {{ .Release.Name }}-etcd-bootstrap
+          name: {{ .Release.Name }}-etcd-config
           defaultMode: 0644
           items:
           - key: etcd.conf.yaml
@@ -338,3 +349,4 @@ spec:
       resources:
         requests:
           storage: {{ .Values.storageCapacity }}
+          

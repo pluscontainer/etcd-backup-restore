@@ -1,16 +1,6 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package snapstore_test
 
@@ -28,7 +18,6 @@ import (
 )
 
 var _ = Describe("Snapshot", func() {
-
 	Describe("Snapshot service", func() {
 		Context("when provied with list of snapshot", func() {
 			It("sorts snapshot by last revision number", func() {
@@ -314,6 +303,50 @@ var _ = Describe("Snapshot", func() {
 				_, err := ParseSnapshot(snapPath)
 				Expect(err).Should(HaveOccurred())
 			})
+		})
+	})
+
+	Context("when provided with immutability time periods", func() {
+		var (
+			snap1 brtypes.Snapshot
+			snap2 brtypes.Snapshot
+		)
+		BeforeEach(func() {
+			now := time.Now().UTC()
+			snapdir := fmt.Sprintf("Backup-%d", now.Second())
+			snap1 = brtypes.Snapshot{
+				CreatedOn:     now,
+				StartRevision: 0,
+				LastRevision:  2088,
+				Kind:          brtypes.SnapshotKindFull,
+				SnapDir:       snapdir,
+			}
+			snap2 = brtypes.Snapshot{
+				CreatedOn:     now,
+				StartRevision: 2089,
+				LastRevision:  3088,
+				Kind:          brtypes.SnapshotKindDelta,
+				SnapDir:       snapdir,
+			}
+		})
+		It("should be deletable when its immutability period is not set", func() {
+			// do not set the immutability period
+			Expect(snap1.IsDeletable()).Should(BeTrue())
+			Expect(snap2.IsDeletable()).Should(BeTrue())
+		})
+		It("should be deletable when its immutability period has expired", func() {
+			// Setting expiry time to be a short time after creation
+			snap1.ImmutabilityExpiryTime = snap1.CreatedOn.Add(time.Nanosecond)
+			snap2.ImmutabilityExpiryTime = snap2.CreatedOn.Add(time.Nanosecond)
+			Expect(snap1.IsDeletable()).To(BeTrue())
+			Expect(snap2.IsDeletable()).To(BeTrue())
+		})
+		It("should not be deletable when its immutability period has not expired", func() {
+			// Setting the expiry time to be a long time after the creation
+			snap1.ImmutabilityExpiryTime = snap1.CreatedOn.Add(time.Hour)
+			snap2.ImmutabilityExpiryTime = snap2.CreatedOn.Add(time.Hour)
+			Expect(snap1.IsDeletable()).To(BeFalse())
+			Expect(snap2.IsDeletable()).To(BeFalse())
 		})
 	})
 })

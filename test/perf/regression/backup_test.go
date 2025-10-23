@@ -19,7 +19,7 @@ import (
 	"path"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/sirupsen/logrus"
 	"k8s.io/client-go/discovery"
@@ -50,10 +50,10 @@ var _ = Describe("Backup", func() {
 
 	BeforeEach(func() {
 		logger := newLogger("BeforeEach")
-		kubeconfigPath := getKubeconfigPath()
+		kubeconfigPath, err := getKubeconfigPath()
+		Expect(err).To(BeNil())
 		logger.Printf("Setting up target using KUBECONFIG=%s", kubeconfigPath)
 
-		var err error
 		config, err := getKubeconfig(kubeconfigPath)
 		Expect(err).To(BeNil())
 

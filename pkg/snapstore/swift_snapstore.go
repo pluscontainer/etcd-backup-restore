@@ -23,9 +23,11 @@ import (
 	"math"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 	"github.com/sirupsen/logrus"
@@ -41,7 +43,7 @@ const (
 	envPrefixSource                 = "SOURCE_OS_"
 	authTypePassword                = "password"
 	authTypeV3ApplicationCredential = "v3applicationcredential"
-	swiftCredentialFile             = "OPENSTACK_APPLICATION_CREDENTIALS"
+	swiftCredentialDirectory        = "OPENSTACK_APPLICATION_CREDENTIALS"
 	swiftCredentialJSONFile         = "OPENSTACK_APPLICATION_CREDENTIALS_JSON"
 )
 
@@ -54,6 +56,10 @@ type SwiftSnapStore struct {
 	maxParallelChunkUploads uint
 	minChunkSize            int64
 	tempDir                 string
+	// deleteChunksForObject decides whether deletion of a (manifest) object should also delete the
+	// associated chunks (segment objects).
+	// Default: true
+	deleteChunksForObject bool
 }
 
 type applicationCredential struct {
@@ -108,10 +114,9 @@ func NewSwiftSnapStore(config *brtypes.SnapstoreConfig) (*SwiftSnapStore, error)
 	})
 	if err != nil {
 		return nil, err
-
 	}
 
-	return NewSwiftSnapstoreFromClient(config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads, config.MinChunkSize, client), nil
+	return NewSwiftSnapstoreFromClient(config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads, config.MinChunkSize, client, true), nil
 
 }
 
@@ -125,7 +130,7 @@ func getClientOpts(isSource bool) (*clientconfig.ClientOpts, error) {
 		return clientOpts, nil
 	}
 
-	if dir, isSet := os.LookupEnv(prefix + swiftCredentialFile); isSet {
+	if dir, isSet := os.LookupEnv(prefix + swiftCredentialDirectory); isSet {
 		clientOpts, err := readSwiftCredentialFiles(dir)
 		if err != nil {
 			return &clientconfig.ClientOpts{}, fmt.Errorf("error getting credentials from %v directory", dir)
@@ -311,7 +316,7 @@ func readSwiftCredentialDir(dirName string) (*swiftCredentials, error) {
 }
 
 // NewSwiftSnapstoreFromClient will create the new Swift snapstore object from Swift client
-func NewSwiftSnapstoreFromClient(bucket, prefix, tempDir string, maxParallelChunkUploads uint, minChunkSize int64, cli *gophercloud.ServiceClient) *SwiftSnapStore {
+func NewSwiftSnapstoreFromClient(bucket, prefix, tempDir string, maxParallelChunkUploads uint, minChunkSize int64, cli *gophercloud.ServiceClient, deleteChunksForObject bool) *SwiftSnapStore {
 	return &SwiftSnapStore{
 		bucket:                  bucket,
 		prefix:                  prefix,
@@ -319,6 +324,7 @@ func NewSwiftSnapstoreFromClient(bucket, prefix, tempDir string, maxParallelChun
 		maxParallelChunkUploads: maxParallelChunkUploads,
 		minChunkSize:            minChunkSize,
 		tempDir:                 tempDir,
+		deleteChunksForObject:   deleteChunksForObject,
 	}
 }
 
@@ -328,22 +334,23 @@ func (s *SwiftSnapStore) Fetch(snap brtypes.Snapshot) (io.ReadCloser, error) {
 	return resp.Body, resp.Err
 }
 
-// Save will write the snapshot to store
+// Save will write the snapshot to store, as a DLO (dynamic large object), as described
+// in https://docs.openstack.org/swift/latest/overview_large_objects.html
 func (s *SwiftSnapStore) Save(snap brtypes.Snapshot, rc io.ReadCloser) error {
 	// Save it locally
-	tmpfile, err := os.CreateTemp(s.tempDir, tmpBackupFilePrefix)
+	tempFile, err := os.CreateTemp(s.tempDir, tmpBackupFilePrefix)
 	if err != nil {
 		rc.Close()
 		return fmt.Errorf("failed to create snapshot tempfile: %v", err)
 	}
 	defer func() {
-		tmpfile.Close()
-		os.Remove(tmpfile.Name())
+		tempFile.Close()
+		os.Remove(tempFile.Name())
 	}()
-	size, err := io.Copy(tmpfile, rc)
+	size, err := io.Copy(tempFile, rc)
 	rc.Close()
 	if err != nil {
-		return fmt.Errorf("failed to save snapshot to tmpfile: %v", err)
+		return fmt.Errorf("failed to save snapshot to tempFile: %v", err)
 	}
 
 	var (
@@ -363,7 +370,7 @@ func (s *SwiftSnapStore) Save(snap brtypes.Snapshot, rc io.ReadCloser) error {
 
 	for i := uint(0); i < s.maxParallelChunkUploads; i++ {
 		wg.Add(1)
-		go s.chunkUploader(&wg, cancelCh, &snap, tmpfile, chunkUploadCh, resCh)
+		go s.chunkUploader(&wg, cancelCh, &snap, tempFile, chunkUploadCh, resCh)
 	}
 
 	logrus.Infof("Uploading snapshot of size: %d, chunkSize: %d, noOfChunks: %d", size, chunkSize, noOfChunks)
@@ -481,49 +488,94 @@ func (s *SwiftSnapStore) List() (brtypes.SnapList, error) {
 
 	sort.Sort(snapList)
 	return snapList, nil
-
 }
 
-// Delete should delete the snapshot file from store
+func (s *SwiftSnapStore) getSnapshotChunks(snapshot brtypes.Snapshot) (brtypes.SnapList, error) {
+	snaps, err := s.List()
+	if err != nil {
+		return nil, err
+	}
+
+	var chunkList brtypes.SnapList
+	for _, snap := range snaps {
+		if snap.IsChunk {
+			chunkParentSnapPath, _ := path.Split(path.Join(snap.Prefix, snap.SnapDir, snap.SnapName))
+			if strings.TrimSuffix(chunkParentSnapPath, "/") == path.Join(snapshot.Prefix, snapshot.SnapDir, snapshot.SnapName) {
+				chunkList = append(chunkList, snap)
+			}
+		}
+	}
+	return chunkList, nil
+}
+
+// Delete deletes the objects related to the DLO (dynamic large object) from the store.
+// This includes the manifest object as well as the segment objects, as
+// described in https://docs.openstack.org/swift/latest/overview_large_objects.html
 func (s *SwiftSnapStore) Delete(snap brtypes.Snapshot) error {
-	result := objects.Delete(s.client, s.bucket, path.Join(snap.Prefix, snap.SnapDir, snap.SnapName), nil)
-	return result.Err
+	if s.deleteChunksForObject {
+		chunks, err := s.getSnapshotChunks(snap)
+		if err != nil {
+			return err
+		}
+
+		if len(chunks) > 0 {
+			var chunkObjectNames []string
+			for _, chunk := range chunks {
+				chunkObjectNames = append(chunkObjectNames, path.Join(chunk.Prefix, chunk.SnapDir, chunk.SnapName))
+			}
+
+			if chunkObjectsDeleteResult := objects.BulkDelete(s.client, s.bucket, chunkObjectNames); chunkObjectsDeleteResult.Err != nil {
+				return chunkObjectsDeleteResult.Err
+			}
+		}
+
+	}
+
+	// delete manifest object
+	return objects.Delete(s.client, s.bucket, path.Join(snap.Prefix, snap.SnapDir, snap.SnapName), nil).Err
 }
 
-// SwiftSnapStoreHash calculates and returns the hash of openstack swift snapstore secret.
-func SwiftSnapStoreHash(config *brtypes.SnapstoreConfig) (string, error) {
-	if _, isSet := os.LookupEnv(swiftCredentialFile); isSet {
-		if dir := os.Getenv(swiftCredentialFile); dir != "" {
-			swiftConfig, err := readSwiftCredentialDir(dir)
-			if err != nil {
-				return "", fmt.Errorf("error getting credentials from %v directory", dir)
-			}
-			return getSwiftHash(swiftConfig), nil
+// GetSwiftCredentialsLastModifiedTime returns the latest modification timestamp of the Swift credential file(s)
+func GetSwiftCredentialsLastModifiedTime() (time.Time, error) {
+	if dir, isSet := os.LookupEnv(swiftCredentialDirectory); isSet {
+		// credential files which are essential for creating the snapstore
+		var credentialFiles []string
+		// checking authType
+		dirEntries, err := os.ReadDir(dir)
+		if err != nil {
+			return time.Time{}, err
 		}
-	}
-
-	if _, isSet := os.LookupEnv(swiftCredentialJSONFile); isSet {
-		if filename := os.Getenv(swiftCredentialJSONFile); filename != "" {
-			swiftConfig, err := swiftCredentialsFromJSON(filename)
-			if err != nil {
-				return "", fmt.Errorf("error getting credentials using %v file", filename)
-			}
-			return getSwiftHash(swiftConfig), nil
+		authType, err := getSwiftCredentialAuthType(dirEntries)
+		if err != nil {
+			return time.Time{}, err
 		}
+
+		if authType == authTypePassword {
+			credentialFiles = []string{"authURL", "tenantName", "domainName", "username", "password"}
+		} else {
+			credentialFiles = []string{"authURL", "tenantName", "domainName", "applicationCredentialID", "applicationCredentialName", "applicationCredentialSecret"}
+		}
+		for i := range credentialFiles {
+			credentialFiles[i] = filepath.Join(dir, credentialFiles[i])
+		}
+
+		swiftTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to get Swift credential timestamp from the directory %v with error: %v", dir, err)
+		}
+		return swiftTimeStamp, nil
 	}
 
-	return "", nil
-}
-
-func getSwiftHash(config *swiftCredentials) string {
-	var data string
-	if config.AuthType == authTypeV3ApplicationCredential {
-		data = fmt.Sprintf("%s%s%s%s%s%s", config.AuthURL, config.TenantName, config.ApplicationCredentialID, config.DomainName, config.ApplicationCredentialName, config.ApplicationCredentialSecret)
-	} else {
-		// config.AuthType == authTypePassword
-		data = fmt.Sprintf("%s%s%s%s%s", config.AuthURL, config.TenantName, config.Username, config.DomainName, config.Password)
+	if filename, isSet := os.LookupEnv(swiftCredentialJSONFile); isSet {
+		credentialFiles := []string{filename}
+		swiftTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to fetch file information of the Swift JSON credential file %v with error: %v", filename, err)
+		}
+		return swiftTimeStamp, nil
 	}
-	return getHash(data)
+
+	return time.Time{}, fmt.Errorf("no environment variable set for the Swift credential file")
 }
 
 func isSwiftConfigCorrect(config *swiftCredentials) error {

@@ -53,8 +53,7 @@ const (
 func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int64) error {
 	logger := e.Logger.WithField("actor", "initializer")
 	metrics.CurrentClusterSize.With(prometheus.Labels{}).Set(float64(e.Validator.OriginalClusterSize))
-	start := time.Now()
-	isEtcdMemberPresent := false
+	start := time.Now
 	ctx := context.Background()
 	var err error
 
@@ -65,6 +64,8 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 	if err != nil {
 		logger.Fatalf("failed to create clientset, %v", err)
 	}
+
+	memberHeartbeatPresent :=  m.WasMemberInCluster(ctx, clientSet);
 
 	//Fork: Don't add as learner as this doesn't work for initial member after scale-up -> DB is gone
 	isFirst := m.IsFirstMember()
@@ -94,6 +95,7 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 		if err != nil {
 			logger.Fatalf("failed to create clientset, %v", err)
 		}
+
 		m := member.NewMemberControl(e.Config.EtcdConnectionConfig)
 		isScaleup, err := m.IsClusterScaledUp(ctx, clientSet)
 		if err != nil {
@@ -140,7 +142,7 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 	if dataDirStatus != validator.DataDirectoryValid {
 		// Fork: Use isScalingUp here
 		// isScalingUp is true if we are currenty scaling up,
-		if !shouldRestoreFromSnapshot && (dataDirStatus == validator.DataDirStatusInvalidInMultiNode || (e.Validator.OriginalClusterSize > 1 && dataDirStatus == validator.DataDirectoryCorrupt) || (e.Validator.OriginalClusterSize > 1 && isEtcdMemberPresent)) {
+		if !shouldRestoreFromSnapshot && (dataDirStatus == validator.DataDirStatusInvalidInMultiNode || (e.Validator.OriginalClusterSize > 1 && dataDirStatus == validator.DataDirectoryCorrupt) || (e.Validator.OriginalClusterSize > 1 && memberHeartbeatPresent)) {
 			start := time.Now()
 			if err := e.restoreInMultiNode(ctx); err != nil {
 				metrics.RestorationDurationSeconds.With(prometheus.Labels{metrics.LabelRestorationKind: metrics.ValueRestoreSingleMemberInMultiNode, metrics.LabelSucceeded: metrics.ValueSucceededFalse}).Observe(time.Since(start).Seconds())
@@ -164,9 +166,13 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 }
 
 // NewInitializer creates an etcd initializer object.
-func NewInitializer(restoreOptions *brtypes.RestoreOptions, snapstoreConfig *brtypes.SnapstoreConfig, etcdConnectionConfig *brtypes.EtcdConnectionConfig, logger *logrus.Logger) *EtcdInitializer {
-	zapLogger, _ := zap.NewProduction()
-	etcdInit := &EtcdInitializer{
+func NewInitializer(restoreOptions *brtypes.RestoreOptions, snapstoreConfig *brtypes.SnapstoreConfig, etcdConnectionConfig *brtypes.EtcdConnectionConfig, logger *logrus.Logger) (*EtcdInitializer, error) {
+	zapLogger, err := zap.NewProduction()
+	if err != nil {
+		return nil, fmt.Errorf("unable to create the object of zapLogger: %s", err)
+	}
+
+	return &EtcdInitializer{
 		Config: &Config{
 			SnapstoreConfig:      snapstoreConfig,
 			RestoreOptions:       restoreOptions,
@@ -183,9 +189,7 @@ func NewInitializer(restoreOptions *brtypes.RestoreOptions, snapstoreConfig *brt
 			ZapLogger:           zapLogger,
 		},
 		Logger: logger,
-	}
-
-	return etcdInit
+	}, nil
 }
 
 // restoreCorruptData attempts to restore a corrupted data directory.
@@ -226,7 +230,10 @@ func (e *EtcdInitializer) restoreCorruptData() (bool, error) {
 		return false, fmt.Errorf("failed to delete previous temporary data directory: %v", err)
 	}
 
-	rs := restorer.NewRestorer(store, logrus.NewEntry(logger))
+	rs, err := restorer.NewRestorer(store, logrus.NewEntry(logger))
+	if err != nil {
+		return false, err
+	}
 	m := member.NewMemberControl(e.Config.EtcdConnectionConfig)
 	if err := rs.RestoreAndStopEtcd(tempRestoreOptions, m); err != nil {
 		err = fmt.Errorf("failed to restore snapshot: %v", err)

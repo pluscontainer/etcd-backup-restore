@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
 	"net/http/pprof"
@@ -39,6 +38,7 @@ import (
 	"github.com/gardener/etcd-backup-restore/pkg/member"
 	"github.com/gardener/etcd-backup-restore/pkg/miscellaneous"
 	"github.com/gardener/etcd-backup-restore/pkg/snapshot/snapshotter"
+	"github.com/gardener/etcd-backup-restore/pkg/snapstore"
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 	"github.com/ghodss/yaml"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -373,9 +373,23 @@ func (h *HTTPHandler) serveLatestSnapshotMetadata(rw http.ResponseWriter, req *h
 		return
 	}
 
+	store, err := snapstore.GetSnapstore(h.SnapstoreConfig)
+	if err != nil {
+		h.Logger.Warnf("Unable to create snapstore from configured storage provider: %v", err)
+		rw.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	fullSnap, deltaSnaps, err := miscellaneous.GetLatestFullSnapshotAndDeltaSnapList(store)
+	if err != nil {
+		h.Logger.Warnf("Unable to fetch latest snapshots from snapstore: %v", err)
+		rw.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
 	resp := latestSnapshotMetadataResponse{
-		FullSnapshot:   h.Snapshotter.PrevFullSnapshot,
-		DeltaSnapshots: h.Snapshotter.PrevDeltaSnapshots,
+		FullSnapshot:   fullSnap,
+		DeltaSnapshots: deltaSnaps,
 	}
 
 	json, err := json.Marshal(resp)
@@ -397,7 +411,7 @@ func (h *HTTPHandler) serveConfig(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	outputFileName := filepath.Join(dir, "etcd.conf.yaml")
-	configYML, err := ioutil.ReadFile(inputFileName)
+	configYML, err := os.ReadFile(inputFileName)
 	if err != nil {
 		h.Logger.Warnf("Unable to read etcd config file: %v", err)
 		rw.WriteHeader(http.StatusInternalServerError)
@@ -467,7 +481,7 @@ func (h *HTTPHandler) serveConfig(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if err := ioutil.WriteFile(outputFileName, data, 0644); err != nil {
+	if err := os.WriteFile(outputFileName, data, 0644); err != nil {
 		h.Logger.Warnf("Unable to write etcd config file: %v", err)
 		rw.WriteHeader(http.StatusInternalServerError)
 		return

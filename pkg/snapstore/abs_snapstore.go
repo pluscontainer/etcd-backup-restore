@@ -23,19 +23,22 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/sirupsen/logrus"
+	"k8s.io/utils/pointer"
 
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 )
 
 const (
-	absCredentialFile     = "AZURE_APPLICATION_CREDENTIALS"
-	absCredentialJSONFile = "AZURE_APPLICATION_CREDENTIALS_JSON"
+	absCredentialDirectory = "AZURE_APPLICATION_CREDENTIALS"
+	absCredentialJSONFile  = "AZURE_APPLICATION_CREDENTIALS_JSON"
 )
 
 // ABSSnapStore is an ABS backed snapstore.
@@ -49,56 +52,63 @@ type ABSSnapStore struct {
 }
 
 type absCredentials struct {
-	BucketName     string `json:"bucketName"`
-	SecretKey      string `json:"storageKey"`
-	StorageAccount string `json:"storageAccount"`
+	BucketName     string  `json:"bucketName"`
+	StorageKey     string  `json:"storageKey"`
+	StorageAccount string  `json:"storageAccount"`
+	Domain         *string `json:"domain,omitempty"`
 }
 
 // NewABSSnapStore create new ABSSnapStore from shared configuration with specified bucket
 func NewABSSnapStore(config *brtypes.SnapstoreConfig) (*ABSSnapStore, error) {
-	storageAccount, storageKey, err := getCredentials(getEnvPrefixString(config.IsSource))
+	absCreds, err := getCredentials(getEnvPrefixString(config.IsSource))
 	if err != nil {
 		return nil, err
 	}
 
-	credentials, err := azblob.NewSharedKeyCredential(storageAccount, storageKey)
+	sharedKeyCredential, err := azblob.NewSharedKeyCredential(absCreds.StorageAccount, absCreds.StorageKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create shared key credentials: %v", err)
 	}
 
-	p := azblob.NewPipeline(credentials, azblob.PipelineOptions{
+	p := azblob.NewPipeline(sharedKeyCredential, azblob.PipelineOptions{
 		Retry: azblob.RetryOptions{
 			TryTimeout: downloadTimeout,
 		}})
-	u, err := url.Parse(fmt.Sprintf("https://%s.%s", storageAccount, brtypes.AzureBlobStorageHostName))
+
+	domain := brtypes.AzureBlobStorageGlobalDomain
+	if absCreds.Domain != nil {
+		domain = *absCreds.Domain
+	}
+
+	u, err := url.Parse(fmt.Sprintf("https://%s.%s", absCreds.StorageAccount, domain))
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse service url: %v", err)
 	}
+
 	serviceURL := azblob.NewServiceURL(*u, p)
 	containerURL := serviceURL.NewContainerURL(config.Container)
 
 	return GetABSSnapstoreFromClient(config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads, config.MinChunkSize, &containerURL)
 }
 
-func getCredentials(prefixString string) (string, string, error) {
-
+func getCredentials(prefixString string) (*absCredentials, error) {
 	if filename, isSet := os.LookupEnv(prefixString + absCredentialJSONFile); isSet {
 		credentials, err := readABSCredentialsJSON(filename)
 		if err != nil {
-			return "", "", fmt.Errorf("error getting credentials using %v file", filename)
+			return nil, fmt.Errorf("error getting credentials using %v file with error: %w", filename, err)
 		}
-		return credentials.StorageAccount, credentials.SecretKey, nil
+		return credentials, nil
 	}
 
-	if dir, isSet := os.LookupEnv(prefixString + absCredentialFile); isSet {
+	if dir, isSet := os.LookupEnv(prefixString + absCredentialDirectory); isSet {
 		credentials, err := readABSCredentialFiles(dir)
 		if err != nil {
-			return "", "", fmt.Errorf("error getting credentials from %v dir", dir)
+			return credentials, fmt.Errorf("error getting credentials from %v dir with error: %w", dir, err)
 		}
-		return credentials.StorageAccount, credentials.SecretKey, nil
+		return credentials, nil
 	}
 
-	return "", "", fmt.Errorf("unable to get credentials")
+	return nil, fmt.Errorf("unable to get credentials")
 }
 
 func readABSCredentialsJSON(filename string) (*absCredentials, error) {
@@ -130,17 +140,23 @@ func readABSCredentialFiles(dirname string) (*absCredentials, error) {
 
 	for _, file := range files {
 		if file.Name() == "storageAccount" {
-			data, err := os.ReadFile(dirname + "/storageAccount")
+			data, err := os.ReadFile(filepath.Join(dirname, "storageAccount"))
 			if err != nil {
 				return nil, err
 			}
 			absConfig.StorageAccount = string(data)
 		} else if file.Name() == "storageKey" {
-			data, err := os.ReadFile(dirname + "/storageKey")
+			data, err := os.ReadFile(filepath.Join(dirname, "storageKey"))
 			if err != nil {
 				return nil, err
 			}
-			absConfig.SecretKey = string(data)
+			absConfig.StorageKey = string(data)
+		} else if file.Name() == "domain" {
+			data, err := os.ReadFile(filepath.Join(dirname, "domain"))
+			if err != nil {
+				return nil, err
+			}
+			absConfig.Domain = pointer.String(string(data))
 		}
 	}
 
@@ -347,38 +363,35 @@ func (a *ABSSnapStore) Delete(snap brtypes.Snapshot) error {
 	return nil
 }
 
-// ABSSnapStoreHash calculates and returns the hash of azure object storage snapstore secret.
-func ABSSnapStoreHash(config *brtypes.SnapstoreConfig) (string, error) {
-	if _, isSet := os.LookupEnv(absCredentialFile); isSet {
-		if dir := os.Getenv(absCredentialFile); dir != "" {
-			absConfig, err := readABSCredentialFiles(dir)
-			if err != nil {
-				return "", fmt.Errorf("error getting credentials from %v directory", dir)
-			}
-			return getABSHash(absConfig), nil
+// GetABSCredentialsLastModifiedTime returns the latest modification timestamp of the ABS credential file(s)
+func GetABSCredentialsLastModifiedTime() (time.Time, error) {
+	if dir, isSet := os.LookupEnv(absCredentialDirectory); isSet {
+		// credential files which are essential for creating the snapstore
+		credentialFiles := []string{"storageKey", "storageAccount"}
+		for i := range credentialFiles {
+			credentialFiles[i] = filepath.Join(dir, credentialFiles[i])
 		}
+		absTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to get ABS credential timestamp from the directory %v with error: %v", dir, err)
+		}
+		return absTimeStamp, nil
 	}
 
-	if _, isSet := os.LookupEnv(absCredentialJSONFile); isSet {
-		if filename := os.Getenv(absCredentialJSONFile); filename != "" {
-			absConfig, err := readABSCredentialsJSON(filename)
-			if err != nil {
-				return "", fmt.Errorf("error getting credentials using %v file", filename)
-			}
-			return getABSHash(absConfig), nil
+	if filename, isSet := os.LookupEnv(absCredentialJSONFile); isSet {
+		credentialFiles := []string{filename}
+		absTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to fetch file information of the ABS JSON credential file %v with error: %v", filename, err)
 		}
+		return absTimeStamp, nil
 	}
 
-	return "", nil
-}
-
-func getABSHash(config *absCredentials) string {
-	data := fmt.Sprintf("%s%s", config.SecretKey, config.StorageAccount)
-	return getHash(data)
+	return time.Time{}, fmt.Errorf("no environment variable set for the ABS credential file")
 }
 
 func isABSConfigEmpty(config *absCredentials) error {
-	if len(config.SecretKey) != 0 && len(config.StorageAccount) != 0 {
+	if len(config.StorageKey) != 0 && len(config.StorageAccount) != 0 {
 		return nil
 	}
 	return fmt.Errorf("azure object storage credentials: storageKey or storageAccount is missing")

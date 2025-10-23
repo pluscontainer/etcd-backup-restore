@@ -209,10 +209,17 @@ func (b *BackupRestoreServer) runServer(ctx context.Context, restoreOpts *brtype
 	if runServerWithSnapshotter {
 		snapstoreConfig = b.config.SnapstoreConfig
 	}
-	etcdInitializer := initializer.NewInitializer(restoreOpts, snapstoreConfig, b.config.EtcdConnectionConfig, b.logger.Logger)
+	etcdInitializer, err := initializer.NewInitializer(restoreOpts, snapstoreConfig, b.config.EtcdConnectionConfig, b.logger.Logger)
+	if err != nil {
+		return err
+	}
 
 	handler := b.startHTTPServer(etcdInitializer, b.config.SnapstoreConfig.Provider, b.config.EtcdConnectionConfig, b.config.SnapstoreConfig, nil)
-	defer handler.Stop()
+	defer func() {
+		if err := handler.Stop(); err != nil {
+			b.logger.Errorf("unable to stop HTTP server: %s", err)
+		}
+	}()
 
 	metrics.CurrentClusterSize.With(prometheus.Labels{}).Set(float64(restoreOpts.OriginalClusterSize))
 
@@ -333,7 +340,7 @@ func (b *BackupRestoreServer) runServer(ctx context.Context, restoreOpts *brtype
 
 // runEtcdProbeLoopWithSnapshotter runs the etcd probe loop
 // for the case when backup-restore becomes leading sidecar.
-func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx context.Context, handler *HTTPHandler, ssr *snapshotter.Snapshotter, ss brtypes.SnapStore, ssrStopCh chan struct{}, ackCh chan struct{}) {
+func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx context.Context, handler *HTTPHandler, ssr *snapshotter.Snapshotter, ss brtypes.SnapStore, ssrStopCh <-chan struct{}, ackCh chan<- struct{}) {
 	var (
 		err                       error
 		initialDeltaSnapshotTaken bool
@@ -415,18 +422,21 @@ func (b *BackupRestoreServer) runEtcdProbeLoopWithSnapshotter(ctx context.Contex
 			if !initialDeltaSnapshotTaken {
 				// need to take a full snapshot here
 				// if initial deltaSnapshot is not taken
+				// or previous full snapshot wasn't successful
 				var snapshot *brtypes.Snapshot
 				metrics.SnapshotRequired.With(prometheus.Labels{metrics.LabelKind: brtypes.SnapshotKindDelta}).Set(0)
 				metrics.SnapshotRequired.With(prometheus.Labels{metrics.LabelKind: brtypes.SnapshotKindFull}).Set(1)
 				if snapshot, err = ssr.TakeFullSnapshotAndResetTimer(false); err != nil {
 					metrics.SnapshotterOperationFailure.With(prometheus.Labels{metrics.LabelError: err.Error()}).Inc()
-					b.logger.Errorf("Failed to take substitute first full snapshot: %v", err)
+					ssr.PrevFullSnapshotSucceeded = false
+					b.logger.Errorf("Failed to take substitute full snapshot: %v", err)
 					continue
 				}
+				ssr.PrevFullSnapshotSucceeded = true
 				if b.config.HealthConfig.SnapshotLeaseRenewalEnabled {
 					leaseUpdatectx, cancel := context.WithTimeout(ctx, brtypes.LeaseUpdateTimeoutDuration)
 					defer cancel()
-					if err = heartbeat.FullSnapshotCaseLeaseUpdate(leaseUpdatectx, b.logger, snapshot, ssr.K8sClientset, b.config.HealthConfig.FullSnapshotLeaseName, b.config.HealthConfig.DeltaSnapshotLeaseName); err != nil {
+					if err = heartbeat.FullSnapshotCaseLeaseUpdate(leaseUpdatectx, b.logger, snapshot, ssr.K8sClientset, b.config.HealthConfig.FullSnapshotLeaseName); err != nil {
 						b.logger.Warnf("Snapshot lease update failed : %v", err)
 					}
 				}
@@ -516,7 +526,7 @@ func handleAckState(handler *HTTPHandler, ackCh chan struct{}) {
 }
 
 // handleSsrStopRequest responds to handlers request and stop interrupt.
-func handleSsrStopRequest(ctx context.Context, handler *HTTPHandler, ssr *snapshotter.Snapshotter, ackCh, ssrStopCh chan struct{}, logger *logrus.Entry) {
+func handleSsrStopRequest(ctx context.Context, handler *HTTPHandler, ssr *snapshotter.Snapshotter, ackCh chan<- struct{}, ssrStopCh chan<- struct{}, logger *logrus.Entry) {
 	logger.Info("Starting the handleSsrStopRequest handler...")
 	for {
 		var ok bool
@@ -526,15 +536,9 @@ func handleSsrStopRequest(ctx context.Context, handler *HTTPHandler, ssr *snapsh
 			logger.Infof("handleSsrStopRequest: %v", ctx.Err())
 		}
 
-		ssr.SsrStateMutex.Lock()
-		if ssr.SsrState == brtypes.SnapshotterActive {
-			ssr.SsrStateMutex.Unlock()
-			ssrStopCh <- emptyStruct
-		} else {
-			ssr.SsrState = brtypes.SnapshotterInactive
-			ssr.SsrStateMutex.Unlock()
-			ackCh <- emptyStruct
-		}
+		ackCh <- emptyStruct
+		close(ssrStopCh)
+
 		if !ok {
 			logger.Info("Stopping handleSsrStopRequest handler...")
 			return

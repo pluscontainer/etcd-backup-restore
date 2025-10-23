@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,9 +45,9 @@ import (
 
 const (
 	// Total number of chunks to be uploaded must be one less than maximum limit allowed.
-	s3NoOfChunk           int64 = 9999
-	awsCredentialFile           = "AWS_APPLICATION_CREDENTIALS"
-	awsCredentialJSONFile       = "AWS_APPLICATION_CREDENTIALS_JSON"
+	s3NoOfChunk            int64 = 9999
+	awsCredentialDirectory       = "AWS_APPLICATION_CREDENTIALS"
+	awsCredentialJSONFile        = "AWS_APPLICATION_CREDENTIALS_JSON"
 )
 
 type awsCredentials struct {
@@ -101,7 +102,7 @@ func getSessionOptions(prefixString string) (session.Options, error) {
 		return creds, nil
 	}
 
-	if dir, isSet := os.LookupEnv(prefixString + awsCredentialFile); isSet {
+	if dir, isSet := os.LookupEnv(prefixString + awsCredentialDirectory); isSet {
 		creds, err := readAWSCredentialFiles(dir)
 		if err != nil {
 			return session.Options{}, fmt.Errorf("error getting credentials from %v directory", dir)
@@ -495,34 +496,31 @@ func (s *S3SnapStore) Delete(snap brtypes.Snapshot) error {
 	return err
 }
 
-// S3SnapStoreHash calculates and returns the hash of aws S3 snapstore secret.
-func S3SnapStoreHash(config *brtypes.SnapstoreConfig) (string, error) {
-	if _, isSet := os.LookupEnv(awsCredentialFile); isSet {
-		if dir := os.Getenv(awsCredentialFile); dir != "" {
-			awsConfig, err := readAWSCredentialFromDir(dir)
-			if err != nil {
-				return "", fmt.Errorf("error getting credentials from %v directory", dir)
-			}
-			return getS3Hash(awsConfig), nil
+// GetS3CredentialsLastModifiedTime returns the latest modification timestamp of the AWS credential file(s)
+func GetS3CredentialsLastModifiedTime() (time.Time, error) {
+	if dir, isSet := os.LookupEnv(awsCredentialDirectory); isSet {
+		// credential files which are essential for creating the S3 snapstore
+		credentialFiles := []string{"accessKeyID", "region", "secretAccessKey"}
+		for i := range credentialFiles {
+			credentialFiles[i] = filepath.Join(dir, credentialFiles[i])
 		}
+		awsTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to get AWS credential timestamp from the directory %v with error: %v", dir, err)
+		}
+		return awsTimeStamp, nil
 	}
 
-	if _, isSet := os.LookupEnv(awsCredentialJSONFile); isSet {
-		if filename := os.Getenv(awsCredentialJSONFile); filename != "" {
-			awsConfig, err := credentialsFromJSON(filename)
-			if err != nil {
-				return "", fmt.Errorf("error getting credentials using %v file", filename)
-			}
-			return getS3Hash(awsConfig), nil
+	if filename, isSet := os.LookupEnv(awsCredentialJSONFile); isSet {
+		credentialFiles := []string{filename}
+		awsTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to fetch file information of the AWS JSON credential file %v with error: %v", filename, err)
 		}
+		return awsTimeStamp, nil
 	}
 
-	return "", nil
-}
-
-func getS3Hash(config *awsCredentials) string {
-	data := fmt.Sprintf("%s%s%s", config.AccessKeyID, config.SecretAccessKey, config.Region)
-	return getHash(data)
+	return time.Time{}, fmt.Errorf("no environment variable set for the AWS credential file")
 }
 
 func isAWSConfigEmpty(config *awsCredentials) error {

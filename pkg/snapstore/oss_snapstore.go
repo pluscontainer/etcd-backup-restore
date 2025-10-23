@@ -21,9 +21,11 @@ import (
 	"math"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/sirupsen/logrus"
@@ -44,9 +46,9 @@ type OSSBucket interface {
 
 const (
 	// Total number of chunks to be uploaded must be one less than maximum limit allowed.
-	ossNoOfChunk          int64 = 9999
-	aliCredentialFile           = "ALICLOUD_APPLICATION_CREDENTIALS"
-	aliCredentialJSONFile       = "ALICLOUD_APPLICATION_CREDENTIALS_JSON"
+	ossNoOfChunk           int64 = 9999
+	aliCredentialDirectory       = "ALICLOUD_APPLICATION_CREDENTIALS"
+	aliCredentialJSONFile        = "ALICLOUD_APPLICATION_CREDENTIALS_JSON"
 )
 
 type authOptions struct {
@@ -275,7 +277,7 @@ func getAuthOptions(prefix string) (*authOptions, error) {
 		return ao, nil
 	}
 
-	if dir, isSet := os.LookupEnv(prefix + aliCredentialFile); isSet {
+	if dir, isSet := os.LookupEnv(prefix + aliCredentialDirectory); isSet {
 		ao, err := readALICredentialFiles(dir)
 		if err != nil {
 			return nil, fmt.Errorf("error getting credentials from %v directory", dir)
@@ -341,33 +343,31 @@ func readALICredentialFiles(dirname string) (*authOptions, error) {
 	return aliConfig, nil
 }
 
-// OSSSnapStoreHash calculates and returns the hash of aliCloud OSS snapstore secret.
-func OSSSnapStoreHash(config *brtypes.SnapstoreConfig) (string, error) {
-	if _, isSet := os.LookupEnv(aliCredentialFile); isSet {
-		if dir := os.Getenv(aliCredentialFile); dir != "" {
-			aliConfig, err := readALICredentialFiles(dir)
-			if err != nil {
-				return "", fmt.Errorf("error getting credentials from %v directory", dir)
-			}
-			return getOSSHash(aliConfig), nil
+// GetOSSCredentialsLastModifiedTime returns the latest modification timestamp of the OSS credential file(s)
+func GetOSSCredentialsLastModifiedTime() (time.Time, error) {
+	if dir, isSet := os.LookupEnv(aliCredentialDirectory); isSet {
+		// credential files which are essential for creating the OSS snapstore
+		credentialFiles := []string{"accessKeyID", "accessKeySecret", "storageEndpoint"}
+		for i := range credentialFiles {
+			credentialFiles[i] = filepath.Join(dir, credentialFiles[i])
 		}
+		aliTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to get OSS credential timestamp from the directory %v with error: %v", dir, err)
+		}
+		return aliTimeStamp, nil
 	}
 
-	if _, isSet := os.LookupEnv(aliCredentialJSONFile); isSet {
-		if filename := os.Getenv(aliCredentialJSONFile); filename != "" {
-			aliConfig, err := readALICredentialsJSON(filename)
-			if err != nil {
-				return "", fmt.Errorf("error getting credentials using %v file", filename)
-			}
-			return getOSSHash(aliConfig), nil
+	if filename, isSet := os.LookupEnv(aliCredentialJSONFile); isSet {
+		credentialFiles := []string{filename}
+		aliTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to fetch file information of the OSS JSON credential file %v with error: %v", filename, err)
 		}
+		return aliTimeStamp, nil
 	}
-	return "", nil
-}
 
-func getOSSHash(config *authOptions) string {
-	data := fmt.Sprintf("%s%s%s", config.AccessID, config.AccessKey, config.Endpoint)
-	return getHash(data)
+	return time.Time{}, fmt.Errorf("no environment variable set for the OSS credential file")
 }
 
 func isOSSConfigEmpty(config *authOptions) error {

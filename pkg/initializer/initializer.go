@@ -53,7 +53,7 @@ const (
 func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int64) error {
 	logger := e.Logger.WithField("actor", "initializer")
 	metrics.CurrentClusterSize.With(prometheus.Labels{}).Set(float64(e.Validator.OriginalClusterSize))
-	start := time.Now
+	start := time.Now()
 	ctx := context.Background()
 	var err error
 
@@ -65,7 +65,7 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 		logger.Fatalf("failed to create clientset, %v", err)
 	}
 
-	memberHeartbeatPresent :=  m.WasMemberInCluster(ctx, clientSet);
+	memberHeartbeatPresent := m.WasMemberInCluster(ctx, clientSet)
 
 	//Fork: Don't add as learner as this doesn't work for initial member after scale-up -> DB is gone
 	isFirst := m.IsFirstMember()

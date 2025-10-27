@@ -1,16 +1,6 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package snapstore
 
@@ -25,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,24 +44,24 @@ type ABSSnapStore struct {
 
 type absCredentials struct {
 	BucketName     string  `json:"bucketName"`
-	StorageKey     string  `json:"storageKey"`
 	StorageAccount string  `json:"storageAccount"`
+	StorageKey     string  `json:"storageKey"`
 	Domain         *string `json:"domain,omitempty"`
 }
 
-// NewABSSnapStore create new ABSSnapStore from shared configuration with specified bucket
+// NewABSSnapStore creates a new ABSSnapStore using a shared configuration and a specified bucket
 func NewABSSnapStore(config *brtypes.SnapstoreConfig) (*ABSSnapStore, error) {
 	absCreds, err := getCredentials(getEnvPrefixString(config.IsSource))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get sharedKeyCredential: %v", err)
 	}
 
 	sharedKeyCredential, err := azblob.NewSharedKeyCredential(absCreds.StorageAccount, absCreds.StorageKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create shared key credentials: %v", err)
+		return nil, fmt.Errorf("failed to create shared key sharedKeyCredential: %v", err)
 	}
 
-	p := azblob.NewPipeline(sharedKeyCredential, azblob.PipelineOptions{
+	pipeline := azblob.NewPipeline(sharedKeyCredential, azblob.PipelineOptions{
 		Retry: azblob.RetryOptions{
 			TryTimeout: downloadTimeout,
 		}})
@@ -80,30 +71,69 @@ func NewABSSnapStore(config *brtypes.SnapstoreConfig) (*ABSSnapStore, error) {
 		domain = *absCreds.Domain
 	}
 
-	u, err := url.Parse(fmt.Sprintf("https://%s.%s", absCreds.StorageAccount, domain))
+	blobURL, err := ConstructBlobServiceURL(absCreds.StorageAccount, domain)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse service url: %v", err)
+		return nil, err
 	}
 
-	serviceURL := azblob.NewServiceURL(*u, p)
+	serviceURL := azblob.NewServiceURL(*blobURL, pipeline)
 	containerURL := serviceURL.NewContainerURL(config.Container)
 
 	return GetABSSnapstoreFromClient(config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads, config.MinChunkSize, &containerURL)
+}
+
+// ConstructBlobServiceURL constructs the Blob Service URL based on the activation status of the Azurite Emulator.
+// It checks the environment variable for emulator configuration and constructs the URL accordingly.
+// The function expects the following environment variable:
+// - AZURE_EMULATOR_ENABLED: Indicates whether the Azurite Emulator is enabled (expects "true" or "false").
+func ConstructBlobServiceURL(storageAccount, domain string) (*url.URL, error) {
+	scheme := "https"
+
+	emulatorEnabled, ok := os.LookupEnv(EnvAzureEmulatorEnabled)
+	if ok {
+		isEmulator, err := strconv.ParseBool(emulatorEnabled)
+		if err != nil {
+			return nil, fmt.Errorf("invalid value for %s: %s, error: %w", EnvAzureEmulatorEnabled, emulatorEnabled, err)
+		}
+		if isEmulator {
+			// TODO: going forward, use Azurite with HTTPS (TLS) communication
+			scheme = "http"
+		}
+	}
+
+	return url.Parse(fmt.Sprintf("%s://%s.%s", scheme, storageAccount, domain))
 }
 
 func getCredentials(prefixString string) (*absCredentials, error) {
 	if filename, isSet := os.LookupEnv(prefixString + absCredentialJSONFile); isSet {
 		credentials, err := readABSCredentialsJSON(filename)
 		if err != nil {
-			return nil, fmt.Errorf("error getting credentials using %v file with error: %w", filename, err)
+			return nil, fmt.Errorf("error getting credentials using %v file with error %w", filename, err)
 		}
 		return credentials, nil
+	}
+
+	// TODO: @renormalize Remove this extra handling in v0.31.0
+	// Check if a JSON file is present in the directory, if it is present -> the JSON file must be used for credentials.
+	if dir, isSet := os.LookupEnv(prefixString + absCredentialDirectory); isSet {
+		jsonCredentialFile, err := findFileWithExtensionInDir(dir, ".json")
+		if err != nil {
+			return nil, fmt.Errorf("error while finding a JSON credential file in %v directory with error: %w", dir, err)
+		}
+		if jsonCredentialFile != "" {
+			credentials, err := readABSCredentialsJSON(jsonCredentialFile)
+			if err != nil {
+				return nil, fmt.Errorf("error getting credentials using %v JSON file in a directory with error: %w", jsonCredentialFile, err)
+			}
+			return credentials, nil
+		}
+		// Non JSON credential files might exist in the credential directory, do not return
 	}
 
 	if dir, isSet := os.LookupEnv(prefixString + absCredentialDirectory); isSet {
 		credentials, err := readABSCredentialFiles(dir)
 		if err != nil {
-			return credentials, fmt.Errorf("error getting credentials from %v dir with error: %w", dir, err)
+			return nil, fmt.Errorf("error getting credentials from %v directory with error %w", dir, err)
 		}
 		return credentials, nil
 	}
@@ -140,19 +170,19 @@ func readABSCredentialFiles(dirname string) (*absCredentials, error) {
 
 	for _, file := range files {
 		if file.Name() == "storageAccount" {
-			data, err := os.ReadFile(filepath.Join(dirname, "storageAccount"))
+			data, err := os.ReadFile(path.Join(dirname, file.Name()))
 			if err != nil {
 				return nil, err
 			}
 			absConfig.StorageAccount = string(data)
 		} else if file.Name() == "storageKey" {
-			data, err := os.ReadFile(filepath.Join(dirname, "storageKey"))
+			data, err := os.ReadFile(path.Join(dirname, file.Name()))
 			if err != nil {
 				return nil, err
 			}
 			absConfig.StorageKey = string(data)
 		} else if file.Name() == "domain" {
-			data, err := os.ReadFile(filepath.Join(dirname, "domain"))
+			data, err := os.ReadFile(path.Join(dirname, file.Name()))
 			if err != nil {
 				return nil, err
 			}
@@ -365,6 +395,19 @@ func (a *ABSSnapStore) Delete(snap brtypes.Snapshot) error {
 
 // GetABSCredentialsLastModifiedTime returns the latest modification timestamp of the ABS credential file(s)
 func GetABSCredentialsLastModifiedTime() (time.Time, error) {
+	// TODO: @renormalize Remove this extra handling in v0.31.0
+	// Check if a JSON file is present in the directory, if it is present -> the JSON file must be used for credentials.
+	if dir, isSet := os.LookupEnv(absCredentialDirectory); isSet {
+		modificationTimeStamp, err := getJSONCredentialModifiedTime(dir)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to fetch credential modification time for ABS with error: %w", err)
+		}
+		if !modificationTimeStamp.IsZero() {
+			return modificationTimeStamp, nil
+		}
+		// Non JSON credential files might exist in the credential directory, do not return
+	}
+
 	if dir, isSet := os.LookupEnv(absCredentialDirectory); isSet {
 		// credential files which are essential for creating the snapstore
 		credentialFiles := []string{"storageKey", "storageAccount"}
@@ -373,7 +416,7 @@ func GetABSCredentialsLastModifiedTime() (time.Time, error) {
 		}
 		absTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
 		if err != nil {
-			return time.Time{}, fmt.Errorf("failed to get ABS credential timestamp from the directory %v with error: %v", dir, err)
+			return time.Time{}, fmt.Errorf("failed to get ABS credential timestamp from the directory %v with error: %w", dir, err)
 		}
 		return absTimeStamp, nil
 	}
@@ -382,7 +425,7 @@ func GetABSCredentialsLastModifiedTime() (time.Time, error) {
 		credentialFiles := []string{filename}
 		absTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
 		if err != nil {
-			return time.Time{}, fmt.Errorf("failed to fetch file information of the ABS JSON credential file %v with error: %v", filename, err)
+			return time.Time{}, fmt.Errorf("failed to fetch file information of the ABS JSON credential file %v with error: %w", filename, err)
 		}
 		return absTimeStamp, nil
 	}

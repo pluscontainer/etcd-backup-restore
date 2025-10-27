@@ -1,16 +1,6 @@
-// Copyright (c) 2019 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package server
 
@@ -21,6 +11,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gardener/etcd-backup-restore/pkg/etcdutil/client"
+	"k8s.io/apimachinery/pkg/util/sets"
 
 	"github.com/gardener/etcd-backup-restore/pkg/backoff"
 	"github.com/gardener/etcd-backup-restore/pkg/defragmentor"
@@ -38,7 +31,7 @@ import (
 	brtypes "github.com/gardener/etcd-backup-restore/pkg/types"
 
 	"github.com/prometheus/client_golang/prometheus"
-	cron "github.com/robfig/cron/v3"
+	"github.com/robfig/cron/v3"
 	"github.com/sirupsen/logrus"
 	"go.etcd.io/etcd/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -54,8 +47,7 @@ type BackupRestoreServer struct {
 
 var (
 	// runServerWithSnapshotter indicates whether to start server with or without snapshotter.
-	runServerWithSnapshotter bool = true
-	retryTimeout                  = 5 * time.Second
+	runServerWithSnapshotter = true
 )
 
 // NewBackupRestoreServer return new backup restore server.
@@ -164,7 +156,7 @@ func waitUntilEtcdRunning(ctx context.Context, etcdConnectionConfig *brtypes.Etc
 		case <-ticker.C:
 		}
 	}
-	logger.Info("Etcd is now running. Continuing br startup")
+	logger.Info("Etcd is now running. Continuing backup-restore startup.")
 	return nil
 }
 
@@ -227,19 +219,7 @@ func (b *BackupRestoreServer) runServer(ctx context.Context, restoreOpts *brtype
 		return err
 	}
 
-	m := member.NewMemberControl(b.config.EtcdConnectionConfig)
-	if err := retry.OnError(retry.DefaultBackoff, errors.IsErrNotNil, func() error {
-		cli, err := etcdutil.NewFactory(*b.config.EtcdConnectionConfig).NewCluster()
-		if err != nil {
-			return err
-		}
-		defer cli.Close()
-
-		if err := m.UpdateMemberPeerURL(ctx, cli); err != nil {
-			return err
-		}
-		return nil
-	}); err != nil {
+	if err := b.updatePeerURLIfChanged(ctx, handler.EnableTLS, b.logger.Logger); err != nil {
 		b.logger.Errorf("failed to update member peer url: %v", err)
 	}
 
@@ -308,7 +288,7 @@ func (b *BackupRestoreServer) runServer(ctx context.Context, restoreOpts *brtype
 				m := member.NewMemberControl(b.config.EtcdConnectionConfig)
 				if err := m.PromoteMember(ctx); err == nil {
 					logger.Info("Successfully promoted the learner to a voting member...")
-				} else if err != nil {
+				} else {
 					logger.Errorf("unable to promote the learner to a voting member: %v", err)
 				}
 			}
@@ -336,6 +316,50 @@ func (b *BackupRestoreServer) runServer(ctx context.Context, restoreOpts *brtype
 	}
 
 	return le.Run(ctx)
+}
+
+func (b *BackupRestoreServer) updatePeerURLIfChanged(ctx context.Context, tlsEnabled bool, logger *logrus.Logger) error {
+	logger.Info("Checking if peerURL has changed or not.")
+
+	m := member.NewMemberControl(b.config.EtcdConnectionConfig)
+
+	cli, err := etcdutil.NewFactory(*b.config.EtcdConnectionConfig).NewCluster()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := cli.Close(); err != nil {
+			b.logger.Errorf("failed to close etcd client: %v", err)
+		}
+	}()
+
+	changed, err := hasPeerURLChanged(ctx, m, cli)
+	if err != nil {
+		return err
+	}
+	if changed {
+		b.logger.Info("Etcd member peerURLs found to be changed.")
+		if err = retry.OnError(retry.DefaultBackoff, errors.IsErrNotNil, func() error {
+			if err = m.UpdateMemberPeerURL(ctx, cli); err != nil {
+				return err
+			}
+			b.logger.Info("Successfully updated the peerURLs for etcd member.")
+			return nil
+		}); err != nil {
+			return err
+		}
+		if b.config.UseEtcdWrapper {
+			if err := miscellaneous.RestartEtcdWrapper(ctx, tlsEnabled, b.config.EtcdConnectionConfig); err != nil {
+				b.logger.Fatalf("failed to restart the etcd-wrapper: %v", err)
+			}
+		} else {
+			b.logger.Info("Usage of etcd-wrapper found to be disabled")
+			b.logger.Warnf("To correcly reflect peerURLs in etcd cluster. Please restart the etcd member. More info: https://etcd.io/docs/v3.5/op-guide/runtime-configuration/#update-advertise-peer-urls")
+		}
+	} else {
+		b.logger.Info("No change in peerURLs found. Skipping update of member peer URLs.")
+	}
+	return nil
 }
 
 // runEtcdProbeLoopWithSnapshotter runs the etcd probe loop
@@ -526,7 +550,7 @@ func handleAckState(handler *HTTPHandler, ackCh chan struct{}) {
 }
 
 // handleSsrStopRequest responds to handlers request and stop interrupt.
-func handleSsrStopRequest(ctx context.Context, handler *HTTPHandler, ssr *snapshotter.Snapshotter, ackCh chan<- struct{}, ssrStopCh chan<- struct{}, logger *logrus.Entry) {
+func handleSsrStopRequest(ctx context.Context, handler *HTTPHandler, _ *snapshotter.Snapshotter, ackCh chan<- struct{}, ssrStopCh chan<- struct{}, logger *logrus.Entry) {
 	logger.Info("Starting the handleSsrStopRequest handler...")
 	for {
 		var ok bool
@@ -544,4 +568,21 @@ func handleSsrStopRequest(ctx context.Context, handler *HTTPHandler, ssr *snapsh
 			return
 		}
 	}
+}
+
+func hasPeerURLChanged(ctx context.Context, m member.Control, cli client.ClusterCloser) (bool, error) {
+	podName, err := miscellaneous.GetEnvVarOrError("POD_NAME")
+	if err != nil {
+		return false, fmt.Errorf("error reading POD_NAME env var : %v", err)
+	}
+
+	peerURLsFromEtcdConfig, err := miscellaneous.GetMemberPeerURL(miscellaneous.GetConfigFilePath(), podName)
+	if err != nil {
+		return false, err
+	}
+	existingPeerURLs, err := m.GetPeerURLs(ctx, cli)
+	if err != nil {
+		return false, err
+	}
+	return sets.New[string](peerURLsFromEtcdConfig).Difference(sets.New[string](existingPeerURLs...)).Len() > 0, nil
 }

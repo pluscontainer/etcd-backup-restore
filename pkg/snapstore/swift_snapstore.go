@@ -1,22 +1,13 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package snapstore
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -56,10 +47,6 @@ type SwiftSnapStore struct {
 	maxParallelChunkUploads uint
 	minChunkSize            int64
 	tempDir                 string
-	// deleteChunksForObject decides whether deletion of a (manifest) object should also delete the
-	// associated chunks (segment objects).
-	// Default: true
-	deleteChunksForObject bool
 }
 
 type applicationCredential struct {
@@ -116,7 +103,7 @@ func NewSwiftSnapStore(config *brtypes.SnapstoreConfig) (*SwiftSnapStore, error)
 		return nil, err
 	}
 
-	return NewSwiftSnapstoreFromClient(config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads, config.MinChunkSize, client, true), nil
+	return NewSwiftSnapstoreFromClient(config.Container, config.Prefix, config.TempDir, config.MaxParallelChunkUploads, config.MinChunkSize, client), nil
 
 }
 
@@ -125,15 +112,32 @@ func getClientOpts(isSource bool) (*clientconfig.ClientOpts, error) {
 	if filename, isSet := os.LookupEnv(prefix + swiftCredentialJSONFile); isSet {
 		clientOpts, err := readSwiftCredentialsJSON(filename)
 		if err != nil {
-			return &clientconfig.ClientOpts{}, fmt.Errorf("error getting credentials using %v file", filename)
+			return &clientconfig.ClientOpts{}, fmt.Errorf("error getting credentials using %v file with error: %w", filename, err)
 		}
 		return clientOpts, nil
+	}
+
+	// TODO: @renormalize Remove this extra handling in v0.31.0
+	// Check if a JSON file is present in the directory, if it is present -> the JSON file must be used for credentials.
+	if dir, isSet := os.LookupEnv(prefix + swiftCredentialDirectory); isSet {
+		jsonCredentialFile, err := findFileWithExtensionInDir(dir, ".json")
+		if err != nil {
+			return &clientconfig.ClientOpts{}, fmt.Errorf("error getting credentials using %v JSON file in a directory with error: %w", jsonCredentialFile, err)
+		}
+		if jsonCredentialFile != "" {
+			clientOpts, err := readSwiftCredentialsJSON(jsonCredentialFile)
+			if err != nil {
+				return &clientconfig.ClientOpts{}, fmt.Errorf("error getting credentials using %v JSON file in a directory with error: %w", jsonCredentialFile, err)
+			}
+			return clientOpts, nil
+		}
+		// Non JSON credential files might exist in the credential directory, do not return
 	}
 
 	if dir, isSet := os.LookupEnv(prefix + swiftCredentialDirectory); isSet {
 		clientOpts, err := readSwiftCredentialFiles(dir)
 		if err != nil {
-			return &clientconfig.ClientOpts{}, fmt.Errorf("error getting credentials from %v directory", dir)
+			return &clientconfig.ClientOpts{}, fmt.Errorf("error getting credentials from %v directory with error: %w", dir, err)
 		}
 		return clientOpts, nil
 	}
@@ -316,7 +320,7 @@ func readSwiftCredentialDir(dirName string) (*swiftCredentials, error) {
 }
 
 // NewSwiftSnapstoreFromClient will create the new Swift snapstore object from Swift client
-func NewSwiftSnapstoreFromClient(bucket, prefix, tempDir string, maxParallelChunkUploads uint, minChunkSize int64, cli *gophercloud.ServiceClient, deleteChunksForObject bool) *SwiftSnapStore {
+func NewSwiftSnapstoreFromClient(bucket, prefix, tempDir string, maxParallelChunkUploads uint, minChunkSize int64, cli *gophercloud.ServiceClient) *SwiftSnapStore {
 	return &SwiftSnapStore{
 		bucket:                  bucket,
 		prefix:                  prefix,
@@ -324,7 +328,6 @@ func NewSwiftSnapstoreFromClient(bucket, prefix, tempDir string, maxParallelChun
 		maxParallelChunkUploads: maxParallelChunkUploads,
 		minChunkSize:            minChunkSize,
 		tempDir:                 tempDir,
-		deleteChunksForObject:   deleteChunksForObject,
 	}
 }
 
@@ -512,23 +515,48 @@ func (s *SwiftSnapStore) getSnapshotChunks(snapshot brtypes.Snapshot) (brtypes.S
 // This includes the manifest object as well as the segment objects, as
 // described in https://docs.openstack.org/swift/latest/overview_large_objects.html
 func (s *SwiftSnapStore) Delete(snap brtypes.Snapshot) error {
-	if s.deleteChunksForObject {
-		chunks, err := s.getSnapshotChunks(snap)
+	chunks, err := s.getSnapshotChunks(snap)
+	if err != nil {
+		return err
+	}
+
+	if len(chunks) > 0 {
+		var chunkObjectNames []string
+		for _, chunk := range chunks {
+			chunkObjectNames = append(chunkObjectNames, path.Join(chunk.Prefix, chunk.SnapDir, chunk.SnapName))
+		}
+
+		chunkObjectsDeleteResult := objects.BulkDelete(s.client, s.bucket, chunkObjectNames)
+		if chunkObjectsDeleteResult.Err != nil {
+			// chunkObjectsDeleteResult.Err is the error that occurs while creating the POST request
+			return chunkObjectsDeleteResult.Err
+		}
+
+		// See https://docs.openstack.org/swift/latest/api/bulk-delete.html for more information about this error handling
+		var bulkDeleteErrors []error
+		bulkDeleteResponse, err := chunkObjectsDeleteResult.Extract()
 		if err != nil {
-			return err
+			return fmt.Errorf("error while extracting the bulk delete information from the response %w", err)
 		}
 
-		if len(chunks) > 0 {
-			var chunkObjectNames []string
-			for _, chunk := range chunks {
-				chunkObjectNames = append(chunkObjectNames, path.Join(chunk.Prefix, chunk.SnapDir, chunk.SnapName))
+		if bulkDeleteResponse.NumberNotFound > 0 {
+			bulkDeleteErrors = append(bulkDeleteErrors, fmt.Errorf("error while deleting segment objects with error: %d segment objects not found in the store", bulkDeleteResponse.NumberNotFound))
+		}
+		for _, errorsPerObject := range bulkDeleteResponse.Errors {
+			var filteredErrorStrings []string
+			for _, errorString := range errorsPerObject {
+				if errorString != "" {
+					filteredErrorStrings = append(filteredErrorStrings, errorString)
+				}
 			}
-
-			if chunkObjectsDeleteResult := objects.BulkDelete(s.client, s.bucket, chunkObjectNames); chunkObjectsDeleteResult.Err != nil {
-				return chunkObjectsDeleteResult.Err
+			bulkDeleteErrorString := strings.Join(filteredErrorStrings, ", ")
+			if bulkDeleteErrorString != "" {
+				bulkDeleteErrors = append(bulkDeleteErrors, fmt.Errorf("error while deleting segment object with error: %s", bulkDeleteErrorString))
 			}
 		}
-
+		if len(bulkDeleteErrors) > 0 {
+			return errors.Join(bulkDeleteErrors...)
+		}
 	}
 
 	// delete manifest object
@@ -537,6 +565,19 @@ func (s *SwiftSnapStore) Delete(snap brtypes.Snapshot) error {
 
 // GetSwiftCredentialsLastModifiedTime returns the latest modification timestamp of the Swift credential file(s)
 func GetSwiftCredentialsLastModifiedTime() (time.Time, error) {
+	// TODO: @renormalize Remove this extra handling in v0.31.0
+	// Check if a JSON file is present in the directory, if it is present -> the JSON file must be used for credentials.
+	if dir, isSet := os.LookupEnv(swiftCredentialDirectory); isSet {
+		modificationTimeStamp, err := getJSONCredentialModifiedTime(dir)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("failed to fetch credential modification time for Swift with error: %w", err)
+		}
+		if !modificationTimeStamp.IsZero() {
+			return modificationTimeStamp, nil
+		}
+		// Non JSON credential files might exist in the credential directory, do not return
+	}
+
 	if dir, isSet := os.LookupEnv(swiftCredentialDirectory); isSet {
 		// credential files which are essential for creating the snapstore
 		var credentialFiles []string
@@ -561,7 +602,7 @@ func GetSwiftCredentialsLastModifiedTime() (time.Time, error) {
 
 		swiftTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
 		if err != nil {
-			return time.Time{}, fmt.Errorf("failed to get Swift credential timestamp from the directory %v with error: %v", dir, err)
+			return time.Time{}, fmt.Errorf("failed to get Swift credential timestamp from the directory %v with error: %w", dir, err)
 		}
 		return swiftTimeStamp, nil
 	}
@@ -570,7 +611,7 @@ func GetSwiftCredentialsLastModifiedTime() (time.Time, error) {
 		credentialFiles := []string{filename}
 		swiftTimeStamp, err := getLatestCredentialsModifiedTime(credentialFiles)
 		if err != nil {
-			return time.Time{}, fmt.Errorf("failed to fetch file information of the Swift JSON credential file %v with error: %v", filename, err)
+			return time.Time{}, fmt.Errorf("failed to fetch file information of the Swift JSON credential file %v with error: %w", filename, err)
 		}
 		return swiftTimeStamp, nil
 	}

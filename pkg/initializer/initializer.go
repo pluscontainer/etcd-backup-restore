@@ -1,16 +1,6 @@
-// Copyright (c) 2018 SAP SE or an SAP affiliate company. All rights reserved. This file is licensed under the Apache Software License, v. 2 except as noted otherwise in the LICENSE file.
+// SPDX-FileCopyrightText: 2024 SAP SE or an SAP affiliate company and Gardener contributors
 //
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
 package initializer
 
@@ -19,7 +9,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/gardener/etcd-backup-restore/pkg/errors"
@@ -82,15 +71,8 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 		shouldRestoreFromSnapshot = true
 	}
 
-	podName, err := miscellaneous.GetEnvVarOrError("POD_NAME")
-	if err != nil {
-		logger.Fatalf("Error reading POD_NAME env var : %v", err)
-	}
-
 	// Etcd cluster scale-up case
-	// Note: first member of etcd cluster can never be part of scale-up case.
-	// TODO: consider removing this special check for first cluster member when backup-restore can check presence of any member in cluster.
-	if miscellaneous.IsMultiNode(logger) && !strings.HasSuffix(podName, "0") {
+	if miscellaneous.IsMultiNode(logger) {
 		clientSet, err := miscellaneous.GetKubernetesClientSetOrError()
 		if err != nil {
 			logger.Fatalf("failed to create clientset, %v", err)

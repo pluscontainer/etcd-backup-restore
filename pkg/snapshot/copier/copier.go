@@ -234,7 +234,9 @@ func (c *Copier) doWaitForFinalSnapshot(ctx context.Context, interval time.Durat
 		if err != nil {
 			return nil, err
 		}
-		if fullSnapshot != nil && fullSnapshot.IsFinal {
+		// Fork: Final snapshot won't work as we create a second final snapshot right before ETCd exits
+		// Work-Around: Latest Full-Snapshot is the final snapshot
+		if fullSnapshot != nil {
 			return fullSnapshot, nil
 		}
 

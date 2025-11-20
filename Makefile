@@ -5,8 +5,8 @@
 VERSION             ?= $(shell cat VERSION)
 GIT_SHA             := $(shell git rev-parse --short HEAD || echo "GitNotFound")
 REPO_ROOT           := $(shell dirname "$(realpath $(lastword $(MAKEFILE_LIST)))")
-REGISTRY            ?= europe-docker.pkg.dev/gardener-project/snapshots
-IMAGE_REPOSITORY    := $(REGISTRY)/gardener/etcdbrctl
+REGISTRY            ?= node-647ee1368442ecd1a315c673.ps-xaas.io/gardener
+IMAGE_REPOSITORY    := $(REGISTRY)/etcdbrctl
 REPOSITORY          ?= "github.com/gardener/etcd-backup-restore"
 IMAGE_TAG           := $(VERSION)
 BUILD_DIR           := build

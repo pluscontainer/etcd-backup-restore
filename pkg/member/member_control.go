@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	utilError "github.com/gardener/etcd-backup-restore/pkg/errors"
@@ -50,6 +51,15 @@ type Control interface {
 
 	// IsClusterScaledUp determines whether a etcd cluster is getting scale-up or not.
 	IsClusterScaledUp(context.Context, client.Client) (bool, error)
+
+	//  IsInMemory determines whether the etcd sts is running in-memory
+	IsInMemory(ctx context.Context, clientSet client.Client) (bool, error)
+
+	//  IsFirstMember determines whether the etcd pod is the first pod in the sts
+	IsFirstMember() bool
+
+	// GetReadyReplicas determines how many replicas are currently ready
+	GetReadyReplicas(ctx context.Context, clientSet client.Client) (int, error)
 
 	// IsMemberInCluster checks is the current members peer URL is already part of the etcd cluster.
 	IsMemberInCluster(context.Context) (bool, error)
@@ -364,6 +374,39 @@ func (m *memberControl) GetPeerURLs(ctx context.Context, closer etcdClient.Clust
 		}
 	}
 	return []string{}, nil
+}
+
+// IsInMemory determines whether the etcd sts is running in-memory
+func (m *memberControl) IsInMemory(ctx context.Context, clientSet client.Client) (bool, error) {
+	m.logger.Info("Checking whether this etcd member is running in-memory")
+
+	etcdsts, err := miscellaneous.GetStatefulSet(ctx, clientSet, m.podNamespace, m.podName)
+	if err != nil {
+		m.logger.Errorf("unable to fetch etcd statefulset: %v", err)
+		return false, err
+	}
+
+	return etcdsts.Name == "etcd-main", nil
+
+}
+
+// IsFirstMember determines whether the etcd pod is the first in the sts
+func (m *memberControl) IsFirstMember() bool {
+	m.logger.Info("Checking whether this etcd pod is the first in the sts")
+	return strings.HasSuffix(m.podName, "-0")
+}
+
+// GetReadyReplicas determines how many replicas are currently ready
+func (m *memberControl) GetReadyReplicas(ctx context.Context, clientSet client.Client) (int, error) {
+	m.logger.Info("Checking how many etcd pods are ready")
+
+	etcdsts, err := miscellaneous.GetStatefulSet(ctx, clientSet, m.podNamespace, m.podName)
+	if err != nil {
+		m.logger.Errorf("unable to fetch etcd statefulset: %v", err)
+		return 0, err
+	}
+
+	return int(etcdsts.Status.ReadyReplicas), nil
 }
 
 // WasMemberInCluster checks the whether etcd member was part of etcd cluster.

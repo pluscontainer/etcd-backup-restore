@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 VERSION             ?= $(shell cat VERSION)
-REGISTRY            ?= europe-docker.pkg.dev/gardener-project/snapshots
-IMAGE_REPOSITORY    := $(REGISTRY)/gardener/etcdbrctl
+REGISTRY            ?= node-647ee1368442ecd1a315c673.ps-xaas.io/gardener
+IMAGE_REPOSITORY    := $(REGISTRY)/etcdbrctl
 IMAGE_TAG           := $(VERSION)
 BUILD_DIR           := build
 PLATFORM            ?= $(shell docker info --format '{{.OSType}}/{{.Architecture}}')

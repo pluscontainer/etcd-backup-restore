@@ -448,6 +448,11 @@ func (h *HTTPHandler) serveConfig(rw http.ResponseWriter, req *http.Request) {
 	}
 	config["advertise-client-urls"] = strings.Join(advClientURLs, ",")
 
+	// FORK
+	if h.serveLearnerJoinConfig(rw, req, config, outputFileName) {
+		return
+	}
+
 	config["initial-cluster"] = getInitialCluster(req.Context(), fmt.Sprint(config["initial-cluster"]), *h.EtcdConnectionConfig, *h.Logger, memberName)
 
 	clusterSize, err := miscellaneous.GetClusterSize(fmt.Sprint(config["initial-cluster"]))

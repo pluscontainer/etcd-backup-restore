@@ -47,8 +47,14 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode) error {
 	memberHeartbeatPresent := false
 	ctx := context.Background()
 
+	// FORK
+	restoreFromBackup, err := e.beginInMemoryInitialization(ctx, logger)
+	if err != nil {
+		return err
+	}
+
 	// Etcd cluster scale-up case
-	if miscellaneous.IsMultiNode(logger) {
+	if !restoreFromBackup && miscellaneous.IsMultiNode(logger) {
 		clientSet, err := miscellaneous.GetKubernetesClientSetOrError()
 		if err != nil {
 			logger.Fatalf("failed to create clientset, %v", err)
@@ -73,6 +79,10 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode) error {
 				// restart the `initialization` by exiting the backup-restore.
 				if err := member.AddLearnerWithRetry(ctx, m, addLearnerAttempts, e.Config.RestoreOptions.Config.DataDir); err != nil {
 					logger.Fatalf("unable to add a learner in a cluster: %v", err)
+				}
+				// FORK
+				if err := miscellaneous.MarkLearnerJoin(e.Config.RestoreOptions.Config.DataDir); err != nil {
+					return err
 				}
 				// return here after adding learner(non-voting member) as no restoration or validation required.
 				return nil
@@ -99,10 +109,14 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode) error {
 	metrics.ValidationDurationSeconds.With(prometheus.Labels{metrics.LabelSucceeded: metrics.ValueSucceededTrue}).Observe(time.Since(start).Seconds())
 
 	if dataDirStatus != validator.DataDirectoryValid {
-		if dataDirStatus == validator.DataDirStatusInvalidInMultiNode || (e.Validator.OriginalClusterSize > 1 && dataDirStatus == validator.DataDirectoryCorrupt) || (e.Validator.OriginalClusterSize > 1 && memberHeartbeatPresent) {
+		if !restoreFromBackup && (dataDirStatus == validator.DataDirStatusInvalidInMultiNode || (e.Validator.OriginalClusterSize > 1 && dataDirStatus == validator.DataDirectoryCorrupt) || (e.Validator.OriginalClusterSize > 1 && memberHeartbeatPresent)) {
 			start := time.Now()
 			if err := e.restoreInMultiNode(ctx); err != nil {
 				metrics.RestorationDurationSeconds.With(prometheus.Labels{metrics.LabelRestorationKind: metrics.ValueRestoreSingleMemberInMultiNode, metrics.LabelSucceeded: metrics.ValueSucceededFalse}).Observe(time.Since(start).Seconds())
+				return err
+			}
+			// FORK
+			if err := miscellaneous.MarkLearnerJoin(e.Config.RestoreOptions.Config.DataDir); err != nil {
 				return err
 			}
 			metrics.RestorationDurationSeconds.With(prometheus.Labels{metrics.LabelRestorationKind: metrics.ValueRestoreSingleMemberInMultiNode, metrics.LabelSucceeded: metrics.ValueSucceededTrue}).Observe(time.Since(start).Seconds())
@@ -202,6 +216,8 @@ func (e *EtcdInitializer) restoreCorruptData() (bool, error) {
 	tempRestoreOptions.BaseSnapshot = baseSnap
 	tempRestoreOptions.DeltaSnapList = deltaSnapList
 	tempRestoreOptions.Config.DataDir = fmt.Sprintf("%s.%s", tempRestoreOptions.Config.DataDir, "part")
+	// FORK
+	setRestoredMemberIdentity(&tempRestoreOptions, logger)
 
 	if err := e.removeDir(tempRestoreOptions.Config.DataDir); err != nil {
 		return false, fmt.Errorf("failed to delete previous temporary data directory: %v", err)

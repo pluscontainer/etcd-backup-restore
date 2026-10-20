@@ -44,53 +44,49 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 	logger := e.Logger.WithField("actor", "initializer")
 	metrics.CurrentClusterSize.With(prometheus.Labels{}).Set(float64(e.Validator.OriginalClusterSize))
 	start := time.Now()
+	memberHeartbeatPresent := false
 	ctx := context.Background()
-	var err error
 
-	shouldRestoreFromSnapshot := false
-
-	m := member.NewMemberControl(e.Config.EtcdConnectionConfig)
-	clientSet, err := miscellaneous.GetKubernetesClientSetOrError()
+	// FORK
+	restoreFromBackup, err := e.beginInMemoryInitialization(ctx, logger)
 	if err != nil {
-		logger.Fatalf("failed to create clientset, %v", err)
-	}
-
-	memberHeartbeatPresent := m.WasMemberInCluster(ctx, clientSet)
-
-	//Fork: Don't add as learner as this doesn't work for initial member after scale-up -> DB is gone
-	isFirst := m.IsFirstMember()
-
-	readyReplicas, err := m.GetReadyReplicas(ctx, clientSet)
-	if err != nil {
-		logger.Fatalf("unable to determin ready replicas: %v", err)
-	}
-
-	if isFirst && readyReplicas == 0 {
-		logger.Info("Won't add member as learner because there are no members to learn from")
-
-		//Fork: Set isInMemory so we can later determine if this is a a normal etcd cluster or a in-memory one
-		shouldRestoreFromSnapshot = true
+		return err
 	}
 
 	// Etcd cluster scale-up case
-	if miscellaneous.IsMultiNode(logger) {
-		m := member.NewMemberControl(e.Config.EtcdConnectionConfig)
-		isScaleup, err := m.IsClusterScaledUp(ctx)
+	if !restoreFromBackup && miscellaneous.IsMultiNode(logger) {
+		clientSet, err := miscellaneous.GetKubernetesClientSetOrError()
 		if err != nil {
-			logger.Errorf("scale-up not detected: %v", err)
-		} else if isScaleup && !shouldRestoreFromSnapshot {
-			logger.Info("Etcd cluster scale-up is detected")
-			// Add a learner(non-voting member) to a etcd cluster with retry
-			// If backup-restore is unable to add a learner in a cluster
-			// restart the `initialization` by exiting the backup-restore.
+			logger.Fatalf("failed to create clientset, %v", err)
+		}
 
-			logger.Info("Trying to add member as learner")
+		m := member.NewMemberControl(e.Config.EtcdConnectionConfig)
 
-			if err := member.AddLearnerWithRetry(ctx, m, addLearnerAttempts, e.Config.RestoreOptions.Config.DataDir); err != nil {
-				logger.Fatalf("unable to add a learner in a cluster: %v", err)
+		// check heartbeat of etcd member
+		if memberHeartbeatPresent = m.WasMemberInCluster(ctx, clientSet); memberHeartbeatPresent {
+			logger.Info("member found to be already a part of the cluster")
+			logger.Info("skipping the scale-up check")
+		} else {
+			logger.Info("member heartbeat is not present")
+			logger.Info("backup-restore will start the scale-up check")
+			isScaleup, err := m.IsClusterScaledUp(ctx)
+			if err != nil {
+				logger.Errorf("scale-up not detected: %v", err)
+			} else if isScaleup {
+				logger.Info("Etcd cluster scale-up is detected")
+				// Add a learner(non-voting member) to a etcd cluster with retry
+				// If backup-restore is unable to add a learner in a cluster
+				// restart the `initialization` by exiting the backup-restore.
+				if err := member.AddLearnerWithRetry(ctx, m, addLearnerAttempts, e.Config.RestoreOptions.Config.DataDir); err != nil {
+					logger.Fatalf("unable to add a learner in a cluster: %v", err)
+				}
+				// FORK
+				if err := miscellaneous.MarkLearnerJoin(e.Config.RestoreOptions.Config.DataDir); err != nil {
+					return err
+				}
+				// return here after adding learner(non-voting member) as no restoration or validation required.
+				return nil
 			}
-			// return here after adding learner(non-voting member) as no restoration or validation required.
-			return nil
 		}
 	}
 
@@ -118,12 +114,14 @@ func (e *EtcdInitializer) Initialize(mode validator.Mode, failBelowRevision int6
 	metrics.ValidationDurationSeconds.With(prometheus.Labels{metrics.LabelSucceeded: metrics.ValueSucceededTrue}).Observe(time.Since(start).Seconds())
 
 	if dataDirStatus != validator.DataDirectoryValid {
-		// Fork: Use isScalingUp here
-		// isScalingUp is true if we are currenty scaling up,
-		if !shouldRestoreFromSnapshot && (dataDirStatus == validator.DataDirStatusInvalidInMultiNode || (e.Validator.OriginalClusterSize > 1 && dataDirStatus == validator.DataDirectoryCorrupt) || (e.Validator.OriginalClusterSize > 1 && memberHeartbeatPresent)) {
+		if !restoreFromBackup && (dataDirStatus == validator.DataDirStatusInvalidInMultiNode || (e.Validator.OriginalClusterSize > 1 && dataDirStatus == validator.DataDirectoryCorrupt) || (e.Validator.OriginalClusterSize > 1 && memberHeartbeatPresent)) {
 			start := time.Now()
 			if err := e.restoreInMultiNode(ctx); err != nil {
 				metrics.RestorationDurationSeconds.With(prometheus.Labels{metrics.LabelRestorationKind: metrics.ValueRestoreSingleMemberInMultiNode, metrics.LabelSucceeded: metrics.ValueSucceededFalse}).Observe(time.Since(start).Seconds())
+				return err
+			}
+			// FORK
+			if err := miscellaneous.MarkLearnerJoin(e.Config.RestoreOptions.Config.DataDir); err != nil {
 				return err
 			}
 			metrics.RestorationDurationSeconds.With(prometheus.Labels{metrics.LabelRestorationKind: metrics.ValueRestoreSingleMemberInMultiNode, metrics.LabelSucceeded: metrics.ValueSucceededTrue}).Observe(time.Since(start).Seconds())
@@ -223,6 +221,8 @@ func (e *EtcdInitializer) restoreCorruptData() (bool, error) {
 	tempRestoreOptions.BaseSnapshot = baseSnap
 	tempRestoreOptions.DeltaSnapList = deltaSnapList
 	tempRestoreOptions.Config.DataDir = fmt.Sprintf("%s.%s", tempRestoreOptions.Config.DataDir, "part")
+	// FORK
+	setRestoredMemberIdentity(&tempRestoreOptions, logger)
 
 	if err := e.removeDir(tempRestoreOptions.Config.DataDir); err != nil {
 		return false, fmt.Errorf("failed to delete previous temporary data directory: %v", err)
